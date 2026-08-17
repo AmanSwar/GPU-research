@@ -3,6 +3,20 @@
 **Date:** 2026-08-17. **Target:** top the Artificial Analysis board for GLM-5.2 on
 8×B200 without wrecking the cost plane.
 
+> **⚠ Correction (2026-08-17, later the same day).** The trace archived at
+> `benchmark/runs/sweep-latency-3-1-4/trace.sqlite` and cited throughout this
+> document as "the C1 profile" is **not a C1 capture**: the file was overwritten
+> at 03:11 today, minutes after the AA 10-parallel run, and now holds the **C10**
+> capture (verified by mtime and by four independent signatures in the trace
+> itself). Every profile-*derived* claim below — the 16.3% idle, the 65.4% SM
+> packing, the 10.7% `gridDim==1` share, and the 1.53×/558 tok/s packing ceiling —
+> is therefore **dead or unverifiable until a true C1 re-capture is taken**. The
+> bench-derived numbers (6.91 ms zero-draft forward, the ~1.4× published gap, all
+> SCORECARD rows) are unaffected. The successor document,
+> [`03-glm-5.2-performance-gaps.md`](03-glm-5.2-performance-gaps.md), rebuilds the
+> analysis on the correctly-attributed C10 trace and supersedes this one where
+> they disagree.
+
 This is the payoff document for the corpus. Everything else in
 `/home/aman/code/research` is input. It is written to be read by one person
 deciding what to start on, so every entry answers six questions: what is the
