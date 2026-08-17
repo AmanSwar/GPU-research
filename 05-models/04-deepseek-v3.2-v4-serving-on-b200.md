@@ -127,7 +127,7 @@ repeat any of it.** It does four things that document does not:
   per sub-layer, on a GEMM whose output dimension is 24. DeepSeek themselves name it as the
   source of a determinism problem. It costs serving time and buys training quality.
 - `[inferred]` **Do not chase V4's KV compression for the leaderboard.** 12.2x less KV is worth
-  a great deal at C256 and nothing at C1 with 10 k inputs, where GLM-5.2's KV is 0.59 GiB.
+  a great deal at C256 and nothing at C1 with 10 k inputs, where GLM-5.2's whole KV is 586 MiB.
 - `[verified]` **Do not use `--moe-a2a-backend megamoe` at low latency.** The cookbook states
   MegaMoE "is only wired into the `high-throughput` recipe on Blackwell" and is hidden on
   low-latency and balanced. The DeepGEMM Mega-MoE 1.96x-at-BS=1 number in the industry doc is
@@ -412,8 +412,8 @@ V4-Flash:  (21/4  + 20/128) x 584 B  +  (21/4) x 68 B  =  3,157.3 + 357.0 =  3,5
 |---|---:|---:|---:|---:|---:|
 | **V4-Pro** | 48.0 MiB | 628.9 MiB | **4.91 GiB** | **10.5%** (9.6x cheaper) | 12.2x cheaper |
 | **V4-Flash** | 33.5 MiB | 439.3 MiB | **3.43 GiB** | 7.3% (13.7x) | 17.5x cheaper |
-| V3.2 (MLA+DSA) | 458 MiB | 6.01 GiB | 44.7 GiB | 1.00x | — |
-| GLM-5.2 as shipped | 586 MiB | 7.69 GiB | 57.2 GiB | 1.28x | 1.00x |
+| V3.2 (MLA+DSA) | 458 MiB | 5.87 GiB | 46.94 GiB | 1.00x | — |
+| GLM-5.2 as shipped | 586 MiB | 7.50 GiB | 60.02 GiB | 1.28x | 1.00x |
 
 **`[inferred]` My independent arithmetic gives 10.5% and the paper's abstract claims "10% of KV
 cache compared with DeepSeek-V3.2" at 1M context. That reproduces to within half a point.**
