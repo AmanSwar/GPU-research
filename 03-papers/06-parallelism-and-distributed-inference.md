@@ -16,6 +16,18 @@ measured it here), `[reported]` (author or vendor claim in text I read), or
 result, because a 1.9× on 8×A100 with Llama-2-70B is not a 1.9× on 8×B200 with a
 671B MoE, and pretending otherwise is how you waste a quarter.
 
+> **Citation audit, 2026-08-17.** Every citation in this document was
+> independently re-verified against arXiv metadata (`export.arxiv.org/api`),
+> dblp, the publishers' proceedings records, and the primary sources themselves.
+> **Fabricated citations found and removed: 0** — all 31 originally-cited works
+> exist with the stated titles, authors and identifiers. Nineteen *numerical or
+> attribution* errors were corrected (venues, per-GPU vs aggregate units,
+> which-platform-which-number, simulated vs measured); each correction is marked
+> inline with `[corrected in audit]`. Nine works were added, weighted toward
+> 2025–2026 and toward the one classic the original omitted (Pope et al.,
+> MLSys 2023). Claims that a technique is "in vLLM/SGLang/TensorRT-LLM" now
+> either name the flag/module or are explicitly downgraded.
+
 **A note on model shape.** GLM-5.2's config is not public. Where the arithmetic
 needs concrete numbers I use the two closest *published* configs as brackets:
 
@@ -32,9 +44,29 @@ layers is the pessimistic bracket for collective *count*.
 
 ## Bottom line for our system
 
-Ranked by expected effect on our measured profile (dense GEMM 37.1%, collectives
-19.6% of which 47% is rank-arrival skew, MoE GEMM 19.4%, attention 10.9%, DSA
-indexer 5.8%; 365 tok/s single-stream = 2.740 ms/token).
+Ranked by **expected effect × confidence ÷ cost**, against our measured profile
+(dense GEMM 37.1%, collectives 19.6% of which 47% is rank-arrival skew, MoE GEMM
+19.4%, attention 10.9%, DSA indexer 5.8%; 365 tok/s single-stream = 2.740
+ms/token). Honest summary of the ranking before the detail:
+
+| # | action | expected effect at C1 | confidence | cost to try | ceiling it eats into |
+|---|---|---|---|---|---|
+| 1 | Fix rank-arrival skew (EPLB + graph-capture jitter) | **1.06–1.10×** (365 → 387–402) | **high** — 2 independent measurements | days (flags exist) | the 252 µs/token skew |
+| 2 | DP-attention + EP8 + `--enable-dp-lm-head` (barrier-count reduction) | **1.03–1.08×**, larger at C64 | high | days | collective *count* |
+| 3 | Extend SBO to attn-out-proj + dense AR | **1.05–1.12×** | medium | weeks | the ~285 µs non-skew collective time |
+| 4 | Verify one-shot/multimem AR actually engages at bs=4 and bs=256 | **1.00–1.04×** | high | hours | per-barrier constant |
+| 5 | Deepen EAGLE draft (amortise barriers over more tokens) | **1.05–1.15×** | medium | weeks | everything, divided by acceptance |
+| 6 | 20% off dense GEMM (**not** in this document) | **1.13×** and it is the only path to 500 | — | quarters | 37.1% of budget |
+| 7 | Ladder-Residual retrofit (architectural AR overlap) | 1.0–1.21× `[reported, H100]` | **low for us** | months + retraining | requires touching the model |
+| 8 | Grow the NVLink domain (NVL72) | **1.8× tok/s/GPU at concurrency** | high | $$$ | cost/user, not latency |
+| — | TBO, PP, SP-at-decode, CP-at-decode, inter-node TP | **negative** | high | — | see "What is NOT worth it" |
+
+The single most important structural fact, stated once: **communication work
+alone cannot reach TileRT's 500 tok/s.** Removing 100% of collective time gets us
+to 454. Items 1–5 above realistically deliver 1.15–1.30×, i.e. 420–475 tok/s.
+Item 6 — a 20% dense-GEMM improvement, which is a kernel/quantisation problem and
+outside this document's scope — is what closes the gap, and it composes with the
+communication work rather than competing with it.
 
 1. **Collectives are a latency problem, not a bandwidth problem, and the fix is
    to reduce the *number* of synchronisation points — not to make each one
@@ -52,6 +84,27 @@ indexer 5.8%; 365 tok/s single-stream = 2.740 ms/token).
    measured by SGLang on 96×H100 for DeepSeek-V3 `[verified]`), DSA indexer
    variance, and CPU-side launch jitter. This is a load-balancing and
    CUDA-graph-capture problem, not a NCCL problem.
+
+   *Caveat that matters for us:* EPLB's 2.54× was measured at **EP72 across 9
+   nodes**, where a hot expert stalls a rank behind an IB hop. At **EP8 in one
+   NVLink domain with 32 experts per GPU**, per-rank load averages over 32
+   experts rather than 1, so the variance is far smaller and the realistic gain
+   is a fraction of 2.54× — this is why item 1 in the table above is scored at
+   1.06–1.10×, not 2.5×. Flags: `--enable-eplb`, `--eplb-algorithm`,
+   `--ep-num-redundant-experts` `[verified, local `server_args.py`]`. Instrument
+   first with `--enable-expert-distribution-metrics` `[verified, local]` — if the
+   measured per-rank dispatch spread is under ~10% there is no EPLB win here and
+   the skew is launch jitter, which is a CUDA-graph problem instead.
+
+   The 2026 literature has moved past static redundant-expert placement:
+   **EasyBalance** (arXiv 2608.07964) balances *across layers* with no change to
+   expert→device mapping, reporting GPU idling "mostly over 40%" lower
+   `[reported]`; **FreeBalance** (arXiv 2608.14205) predicts residual workload
+   and overlaps expert migration with the preceding stage, −13.1% prefill latency
+   `[reported]`; **CRAFT** (arXiv 2603.28768) does cost-aware per-layer
+   replication under a memory budget, 1.14× throughput `[reported]`. None of
+   these state hardware in their abstracts and none are in a production engine —
+   treat as direction, not as a plan.
 
 3. **Single-batch overlap (SBO) at tile/expert granularity is the right overlap
    family for us, and we already have the machinery.** Two-batch overlap is

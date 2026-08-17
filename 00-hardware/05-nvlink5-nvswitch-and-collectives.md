@@ -11,6 +11,10 @@ MNNVL kernels that dominate our profile, the NCCL knobs that matter, and a long
 section on **rank arrival skew** — the 47% of our collective time that is not
 transfer. Claims are labelled `[verified]` (I read it in a primary source, path
 or URL given), `[reported]`, `[inferred]`, `[unverified]`.
+Revised 2026-08-17 by an adversarial audit pass; every number below was
+re-checked against the cited source, several were wrong, and the corrections are
+called out inline as **[AUDIT]**. The multimem PTX/SASS matrix (§2.3) is new and
+was produced by assembling probe kernels with the local `ptxas` 13.3.73.
 
 ## Bottom line for our system
 
@@ -25,11 +29,16 @@ or URL given), `[reported]`, `[inferred]`, `[unverified]`.
   `hidden=6144, tp=8, bf16` that is exactly **numTokens <= 10**. EAGLE 3-1-4
   gives 4 tokens/verify step, so C1 is always one-shot and C64 (256 tokens) is
   always two-shot. [verified: `flashinfer/comm/trtllm_mnnvl_ar.py:44,51`]
-- **The one-shot kernel uses only 32 CTAs x 96 threads on a 148-SM GPU** for our
-  shape (derived below from `adjustGridConfig`). 116 SMs sit idle for the whole
-  15 µs, including the whole skew window. The skew is not stealing compute — it
-  is *leaving compute unused*. That is what makes overlap (TBO/SBO/fused
-  epilogue AR) the right lever, not NCCL tuning. [inferred from verified source]
+- **The one-shot kernel asks for only 32 CTAs x 96 threads on a 148-SM GPU** for
+  our shape (derived below from `adjustGridConfig`, and re-verified line by line
+  against the source in this audit). The AR kernel itself can therefore never
+  occupy more than ~32 SMs; 116 SMs' worth of issue slots are *available* for the
+  whole ~15 µs including the skew window. **[AUDIT]** The previous wording ("116
+  SMs sit idle") overclaims: the same trace shows kernel-time shares summing to
+  135% of the busy window, i.e. there is real cross-stream concurrency, so some
+  of those SMs are occupied by other kernels. The correct claim is that the
+  collective *cannot* be the thing saturating the machine, so the lever is
+  overlap and fusion, not NCCL tuning. [inferred from verified source + ledger]
 - **NCCL NVLS is switched OFF on this box by default.** SGLang sets
   `NCCL_NVLS_ENABLE=int(enable_nccl_nvls or enable_symm_mem)` and both default
   `False`, and it also sets `NCCL_CUMEM_ENABLE=0`, which NVLS requires.
@@ -39,8 +48,11 @@ or URL given), `[reported]`, `[inferred]`, `[unverified]`.
 - **NCCL 2.28 halved the Blackwell CTA cap from 32 to 16** — good for us (less
   SM theft) and reversible with `NCCL_MIN_CTAS=32 NCCL_MAX_CTAS=32`. NCCL 2.28
   also adds `NCCL_CTA_POLICY_ZERO` (copy-engine collectives, zero SMs) for
-  alltoall/allgather within an NVLink domain. [verified: NCCL v2.28.3-1 release
-  notes; `nccl.h:64-66` locally]
+  **alltoall / scatter / gather / allgather** within an (MN)NVL domain — note
+  *not* allreduce. [verified: NCCL v2.28.3-1 release notes; `nccl.h:64-66`
+  locally] **[AUDIT]** It is set through `ncclConfig_t.CTAPolicy`, not through
+  the `NCCL_CTA_POLICY` env var, whose documented tokens are only
+  `DEFAULT`/`EFFICIENCY`.
 - **The two NUMA domains do not touch NVLink traffic, but they very likely touch
   the skew.** GPUs 0-3 are on NUMA 0 (cores 0-55,112-167), 4-7 on NUMA 1. All
   GPU-GPU traffic is NV18 through NVSwitch and never crosses UPI. But the host
