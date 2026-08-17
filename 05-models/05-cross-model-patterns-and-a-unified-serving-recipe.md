@@ -90,12 +90,13 @@ The HBM floor shrinks with all three. The ratio:
 |---|---:|---:|---:|
 | GLM-5.2 NVFP4 as shipped, TP8 | 537 us | 1,141 us | **0.47** |
 | GLM-5.2 FP8, TP8 | 537 us | 870 us | 0.62 |
-| **GLM-5.2 with non-expert GEMMs at FP8, TP8** | 537 us | 788 us | **0.68** |
+| **GLM-5.2 with non-expert GEMMs at FP8, TP8** | 537 us | 690-788 us | **0.68-0.78** |
 | DeepSeek-V4-Pro, TP8 | 420 us | 647 us | 0.65 |
 | Qwen3.5-397B-A17B FP8, TP8 | 413 us | 266 us | **1.55** |
 
-The +45% roofline win from requantizing GLM-5.2 (876 -> 1,268 tok/s) will not be realized
-end-to-end unless the collective term is attacked in the same change. §3.2.
+The +45% to +65% roofline win from requantizing GLM-5.2 (876 -> 1,268-1,449 tok/s; the corpus
+does not settle which, see §4.1 correction 4) will not be realized end-to-end unless the
+collective term is attacked in the same change. §3.2.
 
 **4. Pure TP at C1, DP-attention + EP at throughput, crossover between C16 and C64.**
 `[verified]` Four teams, four models, one answer — read off the published recipe cells, not
@@ -134,9 +135,12 @@ the checkpoint quantization-override policy, and the chat/reasoning/tool-call pa
 Everything else — scheduler, batcher, sampler, verify loop, communicator, allocator interface
 — can be model-agnostic. §5.
 
-**9. The corpus contains at least three internal numeric inconsistencies and one unresolved
-contradiction that blocks every collective measurement.** `[inferred]` Corrected in §4.1 and
-§6.4. The contradiction: the ledger states FlashInfer allreduce fusion was off in every run,
+**9. The corpus contains five internal numeric inconsistencies and one unresolved contradiction
+that blocks every collective measurement.** `[inferred]` Corrected in §4.1 and §6.4. The most
+consequential is that `01-glm-5.2` gives two irreconcilable figures for the requantized GLM-5.2
+build (6,048 vs 5,293 MB/rank/token), so the headline requant win is a **band of +45% to +65%**,
+not a point estimate. The contradiction: the ledger states FlashInfer allreduce fusion was off
+in every run,
 yet `tllm_mnnvl_allreduce::oneshotAllreduceFusionKernel` (8.2%) and `twoshotAllreduceKernel`
 (4.3%) are the #2 and #6 kernels in the profile. Until that is resolved, no collective number
 in any of the five documents means anything.
@@ -431,9 +435,11 @@ is enormous: V4-Pro reads **4,960 MB/rank/token against GLM-5.2 NVFP4's 8,756** 
   28.7%), `o_proj` (1,963 MB), the shared expert (708 MB), `q_b_proj` (654 MB), the indexers
   (394 MB), `kv_b_proj` (286 MB). These are plain softmax-attention projections and dense
   FFNs — exactly the tensors DeepSeek keeps in FP8 with no reported loss. Requantizing takes
-  8,756 -> 6,048 MB and the roofline 876 -> **1,268 tok/s**. `[verified]` SGLang already has
-  the escape hatch, `SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN`, and it covers **only** `q_b_proj`
-  (654 of 6,463 fixable MB). Widening it is a loader change.
+  8,756 -> **6,048 MB (roofline 1,268 tok/s) or 5,293 MB (1,449 tok/s)**, depending on which of
+  two mutually inconsistent figures in `01-glm-5.2` §3.2 you take — see §4.1 correction 4.
+  `[verified]` SGLang already has the escape hatch, `SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN`, and it
+  covers **only** `q_b_proj` (654 of 6,463 fixable MB). Widening it is a loader change, not a
+  kernel.
 - **Qwen: worth ~12%, no more.** Of the 41.78 B BF16-active params, **30.10 B is Gated
   DeltaNet** and must stay high precision (`mamba_ssm_dtype: float32` is the checkpoint saying
   so). Only the 9.65 B of gated attention plus the 2.03 B lm_head are safely fixable:
@@ -832,7 +838,7 @@ worth.
 | **GLM-5.2 NVFP4 as shipped, TP8** | 156 | 537 us | 1,141 us | **0.47** |
 | **GLM-5.2 FP8, TP8** | 156 | 537 us | 870 us | **0.62** |
 | DeepSeek-V4-Pro FP4, TP8 | 122 | 420 us | 647 us | **0.65** |
-| **GLM-5.2, non-expert GEMMs at FP8, TP8** | 156 | 537 us | 788 us | **0.68** |
+| **GLM-5.2, non-expert GEMMs at FP8, TP8** | 156 | 537 us | 690-788 us | **0.68-0.78** |
 | DeepSeek-V4-Flash FP4, TP4 | 86 | 296 us | 369 us | **0.80** |
 | **Qwen3.5-397B-A17B FP8, TP8** | 120 | 413 us | 266 us | **1.55** |
 | Kimi K3, TP16 across 2 nodes (@20 us inter-node) | 186 | 3,720 us | 1,079 us | **3.45** |
@@ -842,11 +848,11 @@ worth.
 
 **1. `[inferred]` Every improvement that shrinks the byte term makes the collective problem
 relatively worse, because the collective term does not move.** Read the GLM-5.2 rows in
-sequence: 0.47 as shipped, 0.62 at FP8, **0.68** if you requantize the non-expert GEMMs. The
-requant is worth +45% on the roofline (876 -> 1,268 tok/s) and it takes collectives from 47% to
-68% of the byte floor. **The requant and the collective work are the same project.** Doing the
-requant alone will produce a disappointing end-to-end number and the disappointment will be
-misattributed.
+sequence: 0.47 as shipped, 0.62 at FP8, **0.68-0.78** if you requantize the non-expert GEMMs.
+The requant is worth +45% to +65% on the roofline (876 -> 1,268-1,449 tok/s) and it takes
+collectives from 47% to roughly 70-78% of the byte floor. **The requant and the collective work
+are the same project.** Doing the requant alone will produce a disappointing end-to-end number
+and the disappointment will be misattributed.
 
 **2. `[inferred]` Qwen3.5-397B-A17B is already past 1.0 — its collectives cost more than its
 entire weight read.** A serialized floor of `266 + 413 = 679 us -> 1,473 tok/s`, against a
@@ -1044,7 +1050,7 @@ tok/s ceiling = 7.672e12 / (bytes read per rank per decoded token)
 |---|:--:|---|---:|---:|---:|---:|---|
 | **GLM-5.2 NVFP4 as shipped** | **yes** (56.72 GiB/GPU) | TP8 | 40.30 B | **8,756** | 1.141 | **876** | 18% / 0% / **82%** |
 | GLM-5.2 FP8 | **yes** (89.37 GiB/GPU) | TP8 | 40.30 B | 6,674 | 0.870 | **1,150** | 0% / 92% / 8% |
-| *GLM-5.2, non-expert GEMMs requantized to FP8* | yes | TP8 | 40.30 B | *6,048* | *0.788* | ***1,268*** | *26% / 68% / 6%* |
+| *GLM-5.2, non-expert GEMMs requantized to FP8* | yes | TP8 | 40.30 B | *6,048 or 5,293* | *0.788 / 0.690* | ***1,268 - 1,449*** | *~26-30% / ~55-63% / ~8%* |
 | **DeepSeek-V4-Pro-0813 FP4** | **yes** (103.93 GiB/GPU) | TP8 | 48.85 B | **4,960** | 0.647 | **1,547** | 32% / 58% / **10%** |
 | **DeepSeek-V4-Flash-0731 FP4** | **yes** (19.43 GiB/GPU) | TP4 | ~13.2 B | ~2,828 | 0.369 | **~2,713** | ~30% / ~52% / ~18% |
 | DeepSeek-V3.2-Exp FP8 | yes (80.27 GiB/GPU) | TP8 | 37 B | `[unverified]` | — | — | 0% / ~92% / ~8% |
@@ -1115,10 +1121,11 @@ are solid.
 `04-deepseek` gives its checkpoint size (689.48 GB, 80.27 GiB/GPU at TP8) and its KV cost
 (48,068 B/token) but not a per-token weight-read figure. Row left empty rather than guessed.
 
-### 4.1 Three corrections to the input documents
+### 4.1 Five corrections to the input documents
 
-`[inferred]` Reconciling six models on one denominator surfaced three internal inconsistencies.
-Recording them so nobody re-derives them.
+`[inferred]` Reconciling six models on one denominator surfaced five internal inconsistencies.
+Recording them so nobody re-derives them. Corrections 1, 2 and 4 are single-cell slips;
+correction 3 is a units choice; correction 5 is systematic.
 
 **1. `02-kimi-k3` §3.4 reports "~12% MBU" for both the TP8 and TP16 rows.** The 12.2% is
 correct for TP16 only (1.04 ms floor against an 8.5 ms measured step). At TP8 the same
@@ -1133,7 +1140,19 @@ collective-count-bound workload.
 document's own `E(64) = 367` and `E(256) = 509` reproduce exactly, so this is a single-cell
 slip. §3.4 uses 138.6.
 
-**3. Every roofline in `01-glm-5.2`, `02-kimi-k3` and `03-qwen3` is ~4.3% optimistic** because
+**4. `01-glm-5.2` §3.2 gives two mutually inconsistent figures for the requantized GLM-5.2
+build.** The prose states *"With every non-expert, non-router GEMM at FP8: 6,048.2 MB"* (and
+`04-deepseek` §8.5 independently repeats 6,048 -> 1,268 tok/s). But the same table's own
+"MB saved if FP8" column sums to **3,463.0**, which gives `8,756.1 - 3,463.0 = 5,293.1 MB` and
+**1,449 tok/s**. The two differ by 755 MB and I cannot reconcile them from what is in the
+corpus — the 6,048 figure would require leaving ~1.5 GB of BF16 that the savings column says is
+fixable. `[unverified]` **Both are reported here as a band.** The direction of the finding in
+§3.2 is unaffected and is in fact strengthened by the lower number: at 5,293 MB the collective
+ratio rises to 0.78, not 0.68. **Settle this by summing the actual per-module bytes before
+committing to a requantization plan** — it is a 20-line script over the two `config.json`
+exclusion lists.
+
+**5. Every roofline in `01-glm-5.2`, `02-kimi-k3` and `03-qwen3` is ~4.3% optimistic** because
 they use 8.0 TB/s rather than the driver-derived 7.672. `01-glm-5.2` says so itself
 (*"B200 SXM HBM3e nominal 8.0 TB/s `[unverified]` — I did not measure it on this box, and you
 should"*) and `04-deepseek` flags it. Restated throughout here.
@@ -1389,7 +1408,7 @@ with room for KV, state, CUDA graphs and NCCL buffers.
 | **GLM-5.2 NVFP4, EAGLE 3-1-4** | **yes**, 56.72 GiB/GPU | **TP8**, no DP/EP/TBO | **876** | **365.5** | **2.40x** | `[verified]` this box, real sharegpt, accept 3.16/4 |
 | GLM-5.2 NVFP4, EAGLE 5-1-6 | yes | TP8 | 876 | 541 `[reported]` | 1.62x | SGLang cookbook B200 cell, **AL pinned to 3.5** — not a measurement of acceptance |
 | GLM-5.2 FP8, EAGLE 5-1-6 | yes, 89.37 GiB/GPU | TP8 | 1,150 | 311 `[reported]` | 3.70x | same, AL pinned 3.5 |
-| *GLM-5.2, non-expert GEMMs at FP8* | *yes* | *TP8* | ***1,268*** | *—* | *—* | *`[inferred]` — the requant does not exist yet* |
+| *GLM-5.2, non-expert GEMMs at FP8* | *yes* | *TP8* | ***1,268 - 1,449*** | *—* | *—* | *`[inferred]` — the requant does not exist yet; band per §4.1 correction 4* |
 | **DeepSeek-V4-Pro-0813 FP4** | **yes**, 103.93 GiB/GPU | **TP8**, EAGLE 3-1-4 | **1,547** | **235.3** | **6.57x** | `[verified]` SGLang 0.5.15 first-party 8xB200 data in our fork, isl 8192 / osl 1024 |
 | **DeepSeek-V4-Flash-0731 FP4** | **yes**, 19.43 GiB/GPU (fits on **one** GPU) | **TP4**, EAGLE 3-1-4 | **~2,713** `[inferred, ±10%]` | **343.6** | **~7.9x** | same source, TP4 |
 | DeepSeek-V3.2-Exp FP8 | yes, 80.27 GiB/GPU | TP8 (DP8 for attention) | `[unverified]` | — | — | no per-token byte model in the corpus |
@@ -1424,7 +1443,7 @@ length plus DP-attention) is code our fork already partly has.
 
 `[inferred]` **4. Against the board.** Artificial Analysis GLM-5.2 leaders are 330-336 tok/s
 and TileRT publishes ~500 on GLM-5-FP8 on identical hardware. Our 365.5 already clears the
-board. The 876 shipped-roofline and 1,268 requantized-roofline say the target is not
+board. The 876 shipped-roofline and 1,268-1,449 requantized-roofline say the target is not
 unreasonable — but §3.2 says the requant alone will not deliver it, because it takes collectives
 from 47% to 68% of the byte floor.
 
@@ -1453,8 +1472,10 @@ fractions of the corpus and need no new hardware.
    of 4 against a published 4.5-5.2 of 6 is the largest unexplained gap in the GLM-5.2 story
    and it was derived, not measured.
 5. **Widen `SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN` past `q_b_proj`, and measure the collective
-   ratio at the same time.** 1-2 d. §1.5, §3.2. Roofline 876 -> 1,268 but the collective share
-   goes 47% -> 68%. **Do not measure one without the other.**
+   ratio at the same time.** 1-2 d. §1.5, §3.2. Roofline 876 -> 1,268-1,449 but the collective
+   share goes 47% -> 68-78%. **Do not measure one without the other.** Precede it with the
+   20-line script in §4.1 correction 4 that settles which of the two corpus figures for the
+   requantized byte count is right — the answer changes the expected win by 14%.
 6. **Fix the per-layer KV callback so it can return zero.** 1 d. §5.2, §5.3 item 1. 7.39 GB per
    1 M tokens per GPU on GLM-5.2 today, and the prerequisite for ever serving V4 or a hybrid
    model correctly. DeepSeek-V4 demonstrates the correct pattern.
@@ -1544,13 +1565,14 @@ fact, so a reader can go one level down without re-searching.
 - §1.5 the model-specific requant verdicts (GLM-5.2 take it; Qwen ~12%; K3 a quality risk).
 - §3.1 collective latency per token for six models at a common 3.44 us.
 - §3.2 the collective-latency-to-HBM-floor ratio table — the 0.30 to 4.02 span and the
-  observation that requantizing GLM-5.2 moves its ratio from 0.47 to 0.68.
+  observation that requantizing GLM-5.2 moves its ratio from 0.47 to 0.68-0.78.
 - §3.3 the EP a2a bandwidth cost per model at C1 (12.7-34.3 us/token).
 - §3.4 `E(T)` for five models at T ∈ {1,16,64,256} and the mean-tokens-per-resident-expert
   table showing `M <= 8` everywhere.
 - §4 the whole side-by-side roofline restated at 7.672 TB/s, including the V4-Flash active-byte
   derivation (±10%).
-- §4.1 the three corrections to the input documents.
+- §4.1 the five corrections to the input documents, including the irreconcilable pair of
+  requantized-GLM-5.2 byte figures (6,048 vs 5,293 MB/rank/token).
 - §5.1 the 4x3 token-mixer / channel-mixer grid with seven live cells.
 - §7 the headline table, gaps, and the reading that a large roofline gap is evidence of *not*
   being bandwidth-bound.
