@@ -595,8 +595,8 @@ a single preprint, no independent reproduction, no engine support.
 
 | Paper | Lab | Venue / year | Hardware | Headline result | In production? |
 |---|---|---|---|---|---|
-| SGLang: Efficient Execution of Structured Language Model Programs (RadixAttention) | Zheng et al., Berkeley/Stanford | NeurIPS 2024, arXiv:2312.07104 | A10G 24GB, A100 80GB | up to 6.4× throughput; cache-aware scheduling hits 96% of optimal hit rate [verified] | **Yes** — SGLang core; vLLM `--enable-prefix-caching` |
-| CacheBlend: Fast LLM Serving for RAG with Cached Knowledge Fusion | Yao et al., UChicago/CUHK-SZ | EuroSys 2025, arXiv:2405.16444 | — | non-prefix KV reuse via selective recomputation | Yes — shipped inside LMCache |
+| SGLang: Efficient Execution of Structured Language Model Programs (RadixAttention) | Zheng, Sheng et al., Stanford + UC Berkeley | NeurIPS 2024, arXiv:2312.07104 | A10G 24GB, A100 80GB | up to 6.4× throughput; cache-aware scheduling hits 96% of optimal hit rate [verified] | **Yes** — SGLang core; vLLM `--enable-prefix-caching` |
+| CacheBlend: Fast LLM Serving for RAG with Cached Knowledge Fusion | Yao, Li, Liu et al., UChicago + CUHK-SZ | EuroSys 2025, arXiv:2405.16444 | — | non-prefix KV reuse via selective recomputation | Yes — shipped inside LMCache |
 | LMCache: An Efficient KV Cache Layer for Enterprise-Scale LLM Inference | Liu, Yao, Cheng et al., Tensormesh + UChicago | tech report 2025, lmcache.ai | 8× H100 (GMI Cloud) | 1.9–8.1× lower TTFT, 2.3–14× higher throughput vs basic vLLM [verified] | **Yes** — vLLM `--kv-offloading-backend lmcache`; SGLang `--enable-lmcache` |
 | TraceLab: Characterizing Coding Agent Workloads for LLM Serving | Zhu et al., UW SyFI | arXiv:2606.30560 | trace study (4,300 sessions) | 95.7% token-weighted prefix hit rate; median 119K prefix / 875 append tokens [verified] | Dataset released |
 | Not All Tokens Are Worth Caching (SAECache) | Fang et al., PKU | arXiv:2605.18825 | — | 756× reuse-rate variation by token type; +4.8–5.9 pp hit ratio over best baseline [verified] | No |
@@ -762,7 +762,7 @@ for a P50 latency metric.
 | Tackling the Data-Parallel Load Balancing Bottleneck (BalanceRoute) | Bu, Lyu, Chen, Ye, Zhou; HKUST + Huawei | arXiv:2605.06113 | **144-NPU Ascend 910C** cluster | substantial DP imbalance reduction vs vLLM baselines on Azure-2024 + proprietary traces [reported] | No |
 | ELDR: Expert-Locality-Aware Decode Routing for PD-Disaggregated MoE Serving | Choi, Cho, Xiong et al., KAIST + MSR | arXiv:2607.00466 | 5 nodes × 8 **MI300X**, vLLM 0.21 / ROCm 7.2, NIXL | median TPOT −5.9–13.9% vs best load balancer; 0.8% overhead [verified] | No |
 | SkyWalker (SkyLB): A Locality-Aware Cross-Region Load Balancer | Xia, Mao et al., Berkeley Sky | arXiv:2505.24095 | multi-region | 1.12–2.06× throughput, 1.74–6.30× lower latency, 25% cost reduction [reported] | No |
-| Online Linear Programming for Multi-Objective Routing in LLM Serving | Chen, Ye, Zhou; Stanford/HKUST | arXiv:2607.03948 | Vidur simulator | bid-price control beats heuristics across SLO regimes [reported] | No |
+| Online Linear Programming for Multi-Objective Routing in LLM Serving | Chen, Ye, Zhou; HKUST + Stanford | arXiv:2607.03948 | Vidur simulator | bid-price control beats heuristics across SLO regimes [reported] | No |
 
 ### 4.1 The routing objective: cache locality vs load, and why pure affinity loses
 
@@ -858,11 +858,11 @@ scheduler-loop nondeterminism. The relevant mitigations are:
 | Paper | Lab | Venue / year | Hardware | Headline result | In production? |
 |---|---|---|---|---|---|
 | AlpaServe: Statistical Multiplexing with Model Parallelism | Li, Zheng, Zhong et al., Berkeley/PKU/Stanford | OSDI 2023, arXiv:2302.11665 | 64-GPU cluster; 8× V100-16GB microbenchmarks | 10× higher rates, 2.5× lower deadlines, or 6× burstiness at >99% SLO attainment [verified] | Ideas yes; system is pre-LLM-era |
-| Fast Distributed Inference Serving for LLMs (FastServe) | Wu et al., PKU | arXiv:2305.05920 (no top-tier venue found) | 16× A100, OPT-175B | 31.4× throughput at same avg latency, 17.9× at same tail, vs vLLM [reported] | No |
+| Fast Distributed Inference Serving for LLMs (FastServe) | B. Wu, Zhong, Zhang et al., PKU | arXiv:2305.05920 (no top-tier venue found) | 16× A100, OPT-175B | 31.4× throughput at same avg latency, 17.9× at same tail, vs vLLM [reported] | No |
 | SLOs-Serve: Optimized Serving of Multi-SLO LLMs | Chen, Jia et al., CMU + Google | arXiv:2504.08784 | 6 application scenarios | 2.2× average per-GPU serving capacity [reported] | No |
 | Niyama: Breaking the Silos of LLM Inference Serving | Goel, Mohan, Kwatra, Anupindi, Ramjee; MSR India | arXiv:2503.22562 | — | +32% serving capacity; order-of-magnitude fewer SLO violations under extreme load [reported] | No |
 | PolyServe: Efficient Multi-SLO Serving at Scale | Zhu, Shi, Xu, Shan, Krishnamurthy, Kasikci; UW + ByteDance | arXiv:2507.17769 | C++ implementation + simulator | 1.23× (PD) / 1.18× (colocated) goodput; 92.5% of optimal [verified] | No |
-| Cascade: SLO-aware latency budget for fair, high-goodput serving | Adnan, Mahapatra, Nair; UBC | arXiv:2608.06557 | — | per-request latency budget = SLO − predicted remaining service time | No |
+| Cascade: SLO-aware latency budget for fair, high-goodput serving | Adnan, Mahapatra, Nair et al.; UBC + Microsoft Azure Research | arXiv:2608.06557 | — | per-request latency budget = SLO − predicted remaining service time | No |
 | TurboSpec: Closed-loop Speculation Control for Optimizing Serving Goodput | Liu, Park, Hu, Kwon et al., Berkeley/UCSD | arXiv:2406.14066 | H100 80GB, L40S 48GB; Llama2-7B + 160M draft | optimal k drops with batch size; auto-disables spec at BS≥16 [verified] | Ideas partially in vLLM's spec-decode autotuning |
 
 ### 5.1 Goodput is the right objective, and it is not throughput
@@ -1007,10 +1007,10 @@ activate.
 
 | Paper | Lab | Venue / year | Approach | Result | In production? |
 |---|---|---|---|---|---|
-| Efficient Interactive LLM Serving with Proxy Model-based Sequence Length Prediction (SSJF) | Qiu et al. | AIOps'24, arXiv:2404.08509 | fine-tuned BERT-base proxy predicts output length; speculative SJF | 30.5–39.6% lower JCT, 2.2–3.6× throughput vs FCFS [reported] | No |
+| Efficient Interactive LLM Serving with Proxy Model-based Sequence Length Prediction (SSJF) | Qiu et al., UIUC + IBM Research | AIOps'24, arXiv:2404.08509 | fine-tuned BERT-base proxy predicts output length; speculative SJF | 30.5–39.6% lower JCT, 2.2–3.6× throughput vs FCFS [reported] | No |
 | Efficient LLM Scheduling by Learning to Rank | Fu, Zhu, Su, Qiao, Stoica, Zhang; UCSD/Berkeley/Snowflake | NeurIPS 2024, arXiv:2408.15792 | predict *relative ranks*, not absolute lengths | 2.8× lower latency (chatbot), 6.5× higher throughput (synthetic data gen) [reported] | No — code at hao-ai-lab/vllm-ltr |
-| Scheduling LLM Inference with Uncertainty-Aware Output Length Predictions | — | arXiv:2604.00499 | output length is log-t heavy-tailed; Tail Inflated Expectation replaces point estimate in SJF | — | No |
-| Robust Length Prediction: Heavy-Tailed Prompt-Conditioned Distributions (ProD) | Wang, Qian, Xue, Qian, Zhao | arXiv:2604.07931 | train on *multiple* generations per prompt; median (ProD-M) or distributional (ProD-D) target | consistent prediction-quality gains [reported] | No |
+| Scheduling LLM Inference with Uncertainty-Aware Output Length Predictions | Zheng, Zhang, Fu et al. | arXiv:2604.00499 | output length is log-t heavy-tailed; Tail Inflated Expectation replaces point estimate in SJF | — | No |
+| Robust Length Prediction: Heavy-Tailed Prompt-Conditioned Distributions (ProD) | Wang, Qian, Xue, Qian et al. | arXiv:2604.07931 | train on *multiple* generations per prompt; median (ProD-M) or distributional (ProD-D) target | consistent prediction-quality gains [reported] | No |
 
 ### The arc of this literature is a retreat, and that is the useful signal
 
@@ -1204,25 +1204,25 @@ Every URL below was fetched and read during this survey.
 28. Bu, Lyu, Chen, Song, Liang, Gurung, Fan, Ye, Zhou. *Tackling the Data-Parallel Load Balancing Bottleneck in LLM Serving: Practical Online Routing at Scale* (BalanceRoute). HKUST + Huawei. arXiv:2605.06113 — https://arxiv.org/pdf/2605.06113
 29. Choi, Cho, Xiong et al. *ELDR: Expert-Locality-Aware Decode Routing for PD-Disaggregated MoE Serving.* KAIST + Microsoft Research. arXiv:2607.00466 — https://arxiv.org/pdf/2607.00466
 30. Xia, Mao, Kerney, Jackson, Li, Xing, Shenker, Stoica. *SkyWalker (SkyLB): A Locality-Aware Cross-Region Load Balancer for LLM Inference.* UC Berkeley Sky Computing. arXiv:2505.24095 — https://arxiv.org/pdf/2505.24095
-31. Chen, Ye, Zhou. *Online Linear Programming for Multi-Objective Routing in LLM Serving.* arXiv:2607.03948 — https://arxiv.org/pdf/2607.03948
+31. Chen, Ye, Zhou. *Online Linear Programming for Multi-Objective Routing in LLM Serving.* HKUST + Stanford. arXiv:2607.03948 — https://arxiv.org/pdf/2607.03948
 
 **SLO-aware scheduling, goodput, admission control**
 32. Li, Zheng, Zhong, Liu, Sheng, Jin, Huang, Chen, Zhang, Gonzalez, Stoica. *AlpaServe: Statistical Multiplexing with Model Parallelism for Deep Learning Serving.* **OSDI 2023**. arXiv:2302.11665 — https://arxiv.org/pdf/2302.11665
 33. Wu, Zhong, Zhang, Liu, Liu, Sun, Huang, Liu, Jin. *Fast Distributed Inference Serving for Large Language Models* (FastServe). Peking University. arXiv:2305.05920 — https://arxiv.org/pdf/2305.05920
 34. Chen, Jia et al. *SLOs-Serve: Optimized Serving of Multi-SLO LLMs.* CMU + Google. arXiv:2504.08784 — https://arxiv.org/pdf/2504.08784
 35. Goel, Mohan, Kwatra, Anupindi, Ramjee. *Niyama: Breaking the Silos of LLM Inference Serving.* Microsoft Research India. arXiv:2503.22562 — https://arxiv.org/pdf/2503.22562
-36. Zhu, Shi, Xu, Shan, Krishnamurthy, Kasikci et al. *PolyServe: Efficient Multi-SLO Serving at Scale.* University of Washington + ByteDance. arXiv:2507.17769 — https://arxiv.org/pdf/2507.17769
-37. Adnan, Mahapatra, Nair. *Cascade: Exploiting SLO-Aware latency budget for fair and high goodput LLM inference serving.* arXiv:2608.06557 — https://arxiv.org/pdf/2608.06557
+36. Zhu, Shi, Xu, Shan, Krishnamurthy, Kasikci, Xie. *PolyServe: Efficient Multi-SLO Serving at Scale.* University of Washington + ByteDance. arXiv:2507.17769 — https://arxiv.org/pdf/2507.17769
+37. Adnan, Mahapatra, Nair, Berger, Zardoshti, Fonseca, Choukse. *Cascade: Exploiting SLO-Aware latency budget for fair and high goodput LLM inference serving.* UBC + Microsoft Azure Research + NVIDIA. arXiv:2608.06557 — https://arxiv.org/pdf/2608.06557
 38. Liu, Park, Hu, Kwon, Li, Zhang, Du, Mo, You, Cheung, Deng, Stoica, Zhang. *TurboSpec: Closed-loop Speculation Control System for Optimizing LLM Serving Goodput.* UC Berkeley + UCSD. arXiv:2406.14066 — https://arxiv.org/pdf/2406.14066
 
 **Output-length prediction**
-39. Qiu et al. *Efficient Interactive LLM Serving with Proxy Model-based Sequence Length Prediction.* **AIOps'24**. arXiv:2404.08509 — https://arxiv.org/pdf/2404.08509
+39. Qiu, Mao, Patke, Cui, Jha, Wang, Franke, Kalbarczyk, Başar, Iyer. *Efficient Interactive LLM Serving with Proxy Model-based Sequence Length Prediction.* UIUC + IBM Research. **AIOps'24**. arXiv:2404.08509 — https://arxiv.org/pdf/2404.08509
 40. Fu, Zhu, Su, Qiao, Stoica, Zhang. *Efficient LLM Scheduling by Learning to Rank.* UCSD + Berkeley + Snowflake. **NeurIPS 2024**. arXiv:2408.15792 — https://arxiv.org/pdf/2408.15792
-41. *Scheduling LLM Inference with Uncertainty-Aware Output Length Predictions.* arXiv:2604.00499 — https://arxiv.org/pdf/2604.00499
-42. Wang, Qian, Xue, Qian, Zhao. *Robust Length Prediction: A Perspective from Heavy-Tailed Prompt-Conditioned Distributions* (ProD). arXiv:2604.07931 — https://arxiv.org/pdf/2604.07931
+41. Zheng, Zhang, Fu, Zhou, Luo, Zhu, Zhu, Wang, Yan, Jiang. *Scheduling LLM Inference with Uncertainty-Aware Output Length Predictions.* arXiv:2604.00499 — https://arxiv.org/pdf/2604.00499
+42. Wang, Qian, Xue, Qian et al. *Robust Length Prediction: A Perspective from Heavy-Tailed Prompt-Conditioned Distributions* (ProD). arXiv:2604.07931 — https://arxiv.org/pdf/2604.07931
 
 **Queueing theory**
-43. Dai, Deng, Li, Peng. *Throughput-Optimal Scheduling Algorithms for LLM Inference and AI Agents.* Cornell ORIE + Columbia. arXiv:2504.07347 — https://arxiv.org/pdf/2504.07347
+43. Dai, Deng, Li, Peng. *Throughput-Optimal Scheduling Algorithms for LLM Inference and AI Agents.* Cornell ORIE + Chicago Booth + Columbia Business School. arXiv:2504.07347 — https://arxiv.org/pdf/2504.07347
 44. Nie, Si, Zhou. *A Queueing-Theoretic Framework for Stability Analysis of LLM Inference with KV Cache Memory Constraints.* **ICML 2026**. arXiv:2605.04595 — https://arxiv.org/pdf/2605.04595
 45. Zhou. *Position: LLM Serving Needs Mathematical Optimization and Algorithmic Foundations, Not Just Heuristics.* arXiv:2605.01280 — https://arxiv.org/pdf/2605.01280
 
