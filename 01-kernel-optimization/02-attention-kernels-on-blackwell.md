@@ -26,10 +26,24 @@ such), or `[unverified]`. Numbers I could not source say "not sourced".
   headDimQk 576 / headDimV 512, **page size 1**, static token sparsity, KV split
   across CTAs with gmem reduction, Q tile 8, KV tile 128, A/B operands swapped.
   The cubin is on this box. `[verified]` §8.
-- **It is not bandwidth-bound at C1; it is prologue/epilogue-bound.** The HBM floor for
-  one layer of top-2048 sparse MLA decode is **1.18 MB → 144 ns** at 8.18 TB/s. Our
-  measured per-launch time is ~5.7 µs (inferred from launch counts), i.e. **~40× off
-  roofline**. The fix is not a faster inner loop. `[inferred]` §5.4, §9.
+- **It is not bandwidth-bound at C1 — but the "40× off roofline" framing is wrong, and
+  the real headroom is ~2×.** The naive HBM floor for one layer of top-2048 sparse MLA
+  decode is 1.18 MB → 144 ns at 8.18 TB/s, but that floor is *unreachable at this size*.
+  Measured on this box (§2.6): an **empty** 128-CTA kernel costs **0.70 µs** back-to-back
+  inside a CUDA graph, and a vectorised read of exactly 1.18 MB at 128 CTAs costs
+  **2.17 µs**. Our ~5.7 µs is therefore **~2.6× a same-shape read**, not 40× off anything.
+  The fix is still not a faster inner loop, but the prize is ~3 µs/launch, not 5.6.
+  `[verified]` measurement, `[inferred]` attribution. §2.6, §5.5.
+- **Attention is not where 365 → 500 tok/s comes from.** Attention + indexer is 16.7% of
+  GPU time; deleting it *entirely* buys 1.20× → ~438 tok/s, still short of TileRT's
+  published bar. Dense GEMM (37.1%) and the 47%-of-19.6% rank-arrival skew in the
+  collectives are each larger prizes. Read this document to stop attention from being a
+  *latency* tax, not expecting it to close the gap alone. `[inferred]` §5.5.
+- **Kernel *count* is a first-order cost, and it is measurable.** 11.3M kernels / 8 ranks
+  / ~1305 forward passes ≈ **1082 kernels per pass per rank**; at the measured 0.70 µs
+  minimum kernel period that is **~758 µs/pass of irreducible launch/teardown**, ~11.7%
+  of GPU-busy time. That is the quantitative case for TileRT's fused tile-runtime thesis.
+  `[inferred]` on `[verified]` inputs. §2.6.
 - **The four EAGLE draft tokens each get their own CTA row and their own KV gather.**
   trtllm-gen's sparse-MLA cubins all have `mGroupsTokensHeadsQ = false`, and
   `computeCtaAndClusterConfig` then sets `numCtasPerSeqQ = mMaxSeqLenQ` literally.

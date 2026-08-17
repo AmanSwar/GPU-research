@@ -10,6 +10,16 @@ pulled out of the Nsight Compute 2026.1.1 metric database for chip `gb100` rathe
 recalled. Where I could not source something I say so. Claims are tagged
 `[verified]` / `[reported]` / `[inferred]` / `[unverified]`.
 
+> **Audit note (second pass).** Every measured number in §3, §4 and §6 was independently
+> re-derived from the same cubins with a fresh decoder and reproduces exactly. Three claims
+> did **not** survive and have been corrected in place: the tcgen05 write-barrier statistic
+> (§4.2 — it is 100%, not 97.6%, once you stop counting non-MMA `UTC*` opcodes), the SM clock
+> claim (§1 Table 1 — 1597 MHz is an *idle* clock on this node, not a load clock), and the
+> attribution of the FP4 throughput number to the wrong table of arXiv:2512.02189 (§9.1).
+> Missing material was added: the PTX-ISA-sourced tcgen05 completion model (§4.4), the
+> measured LDGSTS/TMA bytes-in-flight curve (§9.2.3), and the GPC/cluster quantisation trap
+> for persistent kernels (§9.2.5).
+
 ## Bottom line for our system
 
 - **Every scheduler on SM100 issues at most one instruction per cycle, for one warp.** There
@@ -20,29 +30,45 @@ recalled. Where I could not source something I say so. Claims are tagged
   89,584 real SM100 production instructions from `sgl_kernel/sm100`. That is the hardware
   budget for tracking outstanding variable-latency operations in one warp — but a barrier is
   a *counter*, so many loads can share one slot. This is why deeper unrolling still buys MLP.
-- **`tcgen05` MMA is invisible to the warp scoreboard.** `UTCQMMA.2CTA` / `UTCHMMA.2CTA` set
-  **no write barrier** in 97.6% of the 996 instances I disassembled — only a *read* barrier
-  (operand-consumed). Completion is tracked exclusively through `UTCBAR` → mbarrier →
-  `SYNCS.PHASECHK.TRANS64.TRYWAIT`. Consequence: **an ncu profile of an SM100 tensor-core
-  kernel will never show a "waiting for MMA" stall reason** — it shows up as
-  `short_scoreboard` or `barrier`. Interpret accordingly.
+- **`tcgen05` MMA is invisible to the warp scoreboard.** All **592** `UTCHMMA.2CTA` /
+  `UTCQMMA.2CTA` instructions in a real production cubin allocate **no write barrier** —
+  100%, not "most" — only a *read* barrier protecting the descriptor registers. Completion is
+  tracked exclusively through `UTCBAR` (`tcgen05.commit`) → mbarrier →
+  `SYNCS.PHASECHK.TRANS64.TRYWAIT`, which is exactly the mechanism the PTX ISA specifies.
+  Consequence: **an ncu profile of an SM100 tensor-core kernel will never show a "waiting for
+  MMA" stall reason** — it shows up as `short_scoreboard` or `barrier`. Interpret accordingly.
+  [verified, measured + PTX ISA §9.7.17.6.2.1.1]
 - **Nsight Compute on Blackwell dropped two stall reasons and added none.** `imc_miss` and
   `gmma` exist for `ga100`/`gh100` and are absent from `gb100`. There is no instruction-cache
   stall counter on Blackwell; i-cache pressure is only observable through
   `stall_no_instruction`, which conflates i-cache miss with fetch arbitration.
-- **Our GPUs run at 1597 MHz under production load, not the 1965 MHz max.** Any cycle→time
-  conversion you do from microbenchmark papers is 19% optimistic on this node.
-- **Low occupancy is correct for our GEMM/MoE kernels and wrong for our DSA indexer.** The
-  decision rule is Little's Law per pipe, not the occupancy percentage. Section 8 works the
-  numbers.
-- **At batch 1 the fix list is: outstanding loads, not FLOPs.** LDG.128 + `.CONSTANT`,
-  unrolled software pipelines with distinct barrier indices, persistent kernels + CUDA graphs
-  to kill the 3–5 µs launch tax, and `griddepcontrol` to overlap tail/head of dependent
+- **Do not hard-code an SM clock.** This node DVFS's across at least **1050–1965 MHz**;
+  `nvidia-smi` reports 1597 MHz at 0% utilisation with no throttle reason active, 1965 MHz on
+  a genuinely busy GPU, and ~1050–1215 MHz on power-capped ones. Read the clock at measurement
+  time (or take `gpc__cycles_elapsed` from ncu); any cycle↔time conversion done against a
+  fixed number is wrong by up to 1.9×. [verified, `nvidia-smi` sampled repeatedly this session]
+- **Low occupancy is correct for our dense GEMM (37.1%) and MoE expert GEMMs (19.4%), and
+  wrong for our DSA indexer (5.8%) and elementwise (3.7%).** The decision rule is Little's Law
+  per pipe, not the occupancy percentage. Section 8 works the numbers.
+- **At batch 1 the fix list is: outstanding loads, not FLOPs.** Dense GEMM at 37.1% of kernel
+  time has arithmetic intensity 2 (FP8) to 4 (NVFP4) FLOP/byte against a machine balance of
+  ~1125 — it is `long_scoreboard`, not tensor-core, time. The levers are `LDG.E.128` +
+  `.CONSTANT`, unrolled software pipelines with distinct barrier indices, **32 KiB of bytes in
+  flight per SM** (§9.2.3, now a measured target rather than a guess), persistent kernels +
+  CUDA graphs to kill the launch tax, and `griddepcontrol` to overlap tail/head of dependent
   kernels. Section 9.
-- **47% of our collective time is rank arrival skew.** That is a scheduling problem at the
-  grid level with the same shape as a scoreboard stall at the warp level: the fix is to give
-  the waiting party independent work, i.e. overlap the pre-AR compute of rank *i* with the
-  AR wait, not to make the AR faster.
+- **The MoE expert working set does not fit L2, but the draft/verify pair might.** L2 on this
+  part is **126 MB** [verified, `cudaDeviceProp::l2CacheSize` = 132,644,864 B and the Blackwell
+  Tuning Guide]. With 256 experts / 8 active, per-token routed weights are a fraction of that;
+  EAGLE 3-1-4 hits the *same* expert set twice per accepted token. Measure
+  `lts__t_sectors_lookup_hit` on the expert GEMMs across a draft/verify pair before doing
+  anything else to the MoE path — it is the cheapest 19.4% you own.
+- **47% of our collective time is rank arrival skew** — ~9.2% of *all* kernel time spent
+  waiting. That is a scheduling problem at the grid level with the same shape as a scoreboard
+  stall at the warp level: the fix is to give the waiting party independent work (PDL, §9.2.2),
+  i.e. overlap the pre-AR compute of rank *i* with the AR wait, not to make the AR faster.
+  Note that `stall_sleeping` and `stall_membar` are the two counters that will show you the
+  spin side of that wait, and both exist on `gb100`.
 
 ---
 
@@ -87,10 +113,26 @@ Two things fall out of that sentence and they matter a lot:
 | Unified L1 + shared memory / SM | 256 KB | [verified] CUDA PG §20.9.1 |
 | Shared memory carveouts | 0, 8, 16, 32, 64, 100, 132, 164, 196, 228 KB | [verified] CUDA PG §20.9.3 |
 | Max shared memory / block | 227 KB (1 KB reserved) | [verified] CUDA PG §20.9.3 |
-| Max portable cluster size | 8 (16 non-portable opt-in on B200) | [verified] Blackwell Tuning Guide |
-| SM clock, max / observed under load | 1965 MHz / **1597 MHz** | [verified] `nvidia-smi` on this node |
+| Max portable cluster size | 8; **16 non-portable on B200** via `cudaFuncAttributeNonPortableClusterSizeAllowed` | [verified] Blackwell Tuning Guide §1.4.1.2, verbatim |
+| SMs per GPU | **148** | [verified] `cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)` on this node |
+| L2 cache | **132,644,864 B = 126.5 MiB** ("126 MB") | [verified] `l2CacheSize` on this node + Blackwell Tuning Guide §1.4.2.2 |
+| Memory bus width | 7680 bit (960 B) | [verified] `cuDeviceGetAttribute` |
+| SM clock, max / **observed range** | 1965 MHz max; **observed 1050–1965 MHz** | [verified] `nvidia-smi` sampled this session — see note below |
 | Memory clock | 3996 MHz | [verified] `nvidia-smi` |
+| HBM peak BW, computed / marketed | 960 B × 3996 MHz × 2 = **7.67 TB/s** / 8 TB/s | [verified] arithmetic from device attrs; [verified] DGX B200 page quotes 64 TB/s across 8 GPUs |
 | Power limit | 1000 W | [verified] `nvidia-smi` |
+| Dense FP4 tensor peak | 9 PFLOPS/GPU (72 PFLOPS per DGX B200, dense) | [verified] nvidia.com DGX B200 spec table |
+
+**On the SM clock — correction to an earlier claim in this document.** A previous revision
+asserted "our GPUs run at 1597 MHz under production load". Re-sampling `nvidia-smi` this
+session shows 1597 MHz is what the part reports at **0% utilisation with every
+`clocks_event_reasons.*` flag Not Active** (~250 W draw). A GPU actually at 100% utilisation
+was observed at **1965 MHz**, and power-capped siblings at 1050–1215 MHz with
+`clocks_event_reasons` = `0x4` (SW power cap). So 1597 MHz is an idle/persistence clock, not a
+load clock, and the "19% optimistic" correction factor derived from it was wrong. **Practical
+rule: never convert cycles↔time from a constant. Take `gpc__cycles_elapsed.max` and
+`gpu__time_duration.sum` from the same ncu report, or profile with `--clock-control base` when
+you want run-to-run comparability.** [verified]
 
 Note the INT32:FP32 ratio of 1:2. Address arithmetic (`IMAD`, `IADD3`, `LEA`, `SHF`) runs on
 a datapath half as wide as FP32. In a GEMV inner loop where you emit one `IADD3` per pointer
@@ -159,14 +201,32 @@ nvcc -arch=sm_100a -cubin -O3 -Xptxas -v -o /dev/null kernel.cu
 # ptxas info : Used 34 registers, used 0 barriers
 ```
 
+Two `nvdisasm` flags worth knowing that the previous revision missed:
+
+```bash
+$NVD -c -json foo.cubin        # --emit-json: machine-readable disassembly, no regex parsing
+$NVD -c -novliw foo.cubin      # --no-vliw: "disassemble paired instructions in normal syntax"
+```
+
+`-novliw` exists in 13.3 because *some* target in nvdisasm's arch list uses a paired/VLIW
+print form. **It is not SM100.** `diff <($NVD -c k.cubin) <($NVD -c -novliw k.cubin)` is empty
+for both `sm_100a` and `sm_120` cubins on this box, i.e. there is no paired-instruction
+encoding to worry about on Blackwell datacenter parts, which is consistent with the
+one-instruction-per-scheduler-per-cycle model in §1 [verified, ran it].
+
 ### Is the SASS ISA documented?
 
-**No.** NVIDIA publishes an *opcode list* per architecture in the CUDA Binary Utilities doc
-(instruction mnemonics and one-line descriptions), but **not** operand encodings and
-**not** the control field. Everything in §3 below is reverse-engineered. What is different
-here from the usual blog-post situation is that I re-derived and re-validated the decode
-against real `sm_100a` output on this machine rather than trusting a table — see the
-validation methodology, which is the part you should actually trust.
+**Partly, and better than folklore says.** NVIDIA publishes an *opcode list with one-line
+descriptions* per architecture in the CUDA Binary Utilities doc — for us that is
+[§4.4 "Blackwell Instruction Set", Table 8](https://docs.nvidia.com/cuda/cuda-binary-utilities/index.html#blackwell-instruction-set)
+(CC 10.0 and 12.0), which also documents the operand-location syntax you will see in
+disassembly: `RX`, `URX`, `SRX`, `PX`, `UPX`, `c[X][Y]`, **`desc[URX][RY]`** (memory
+descriptor), **`gdesc[URX]`** (global memory descriptor) and **`tmem[URX]`** (tensor memory)
+[verified, read the page]. What NVIDIA does **not** publish is operand *encodings* and the
+*control field*. Everything in §3 below is reverse-engineered. What is different here from the
+usual blog-post situation is that the decode was re-derived and re-validated against real
+`sm_100a` output on this machine rather than trusting a table — see the validation
+methodology, which is the part you should actually trust.
 
 ---
 
@@ -219,6 +279,15 @@ disassembly of a trivial FP16 GEMV compiled with `nvcc -arch=sm_100a`:
    `wrtdb` and `readb` take values in **{0,1,2,3,4,5,7}** and never 6. 7 is the "none"
    sentinel, giving exactly **6 usable barriers** — the same count as Volta through Hopper.
    A misaligned field would produce a uniform distribution.
+
+**Independent corroboration [verified].** The same bit assignment — stall 105–108, yield 109,
+write barrier 110–112, read barrier 113–115, six-bit wait mask 116–121, four reuse flags
+122–125, bits 126–127 zero — is stated verbatim by *The Software Frontier*, who decoded it on
+five architectures including `sm_100`, and it traces to Jia, Maggioni, Staiger & Scarpazza,
+*Dissecting the NVIDIA Volta GPU Architecture via Microbenchmarking* (arXiv:1804.06826) and its
+Turing successor (arXiv:1903.07486), which are the original public sources for the field
+layout. Three independent derivations agreeing is about as good as an undocumented encoding
+gets. Note the field is **23 bits extracted, 21 bits used**.
 
 Decoder (drop this in your toolbox):
 

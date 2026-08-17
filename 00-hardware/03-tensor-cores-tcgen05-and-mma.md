@@ -3,42 +3,69 @@
 ## What this is
 
 A working reference for the SM100 (B200) 5th-gen tensor core, written against primary
-sources: the `tcgen05.*` PTX intrinsic headers shipped in our local CUDA 13.3 toolkit
-(`/home/aman/code/cuda-13.3/.../cccl/cuda/__ptx/instructions/`), NVIDIA's CUTLASS source
-and CuTe-DSL docs, the Colfax tutorials, and device attributes read off this box.
+sources: **the PTX ISA 9.0 specification §9.7.17 (read in full, not summarised)**, the
+`tcgen05.*` PTX intrinsic headers shipped in our local CUDA 13.3 toolkit
+(`/home/aman/code/cuda-13.3/.../cccl/cuda/__ptx/instructions/`), NVIDIA's CUTLASS source,
+the Colfax tutorials, and device attributes read off this box.
 Every substantive claim is tagged `[verified]` (I read it in a primary source, path/URL
 given), `[reported]` (a vendor or company asserts it), `[inferred]` (my arithmetic or
 reasoning from architecture), or `[unverified]` (plausible, not sourced).
 Where a widely-repeated claim is wrong or unsourceable, it is called out as such.
 
+> **Audit note (second pass).** This document was re-verified end to end against the
+> PTX ISA §9.7.17 text, the local CCCL headers, and CUTLASS source. Several first-pass
+> claims were wrong and have been corrected in place — the `.kind`-vs-`.scale_vectorsize`
+> table, the `tcgen05.mma`/`tcgen05.mma.ws` target lists, the `.i8` N-step values, and a
+> CUTLASS struct name (`SM100_MMA_MXF8F6F4_TS`) that does not exist. Four things the first
+> pass listed as "not sourced" — collector semantics, `tcgen05.shift`, the async-pipeline
+> ordering rules, and `.16x32bx2` — are now sourced from the PTX ISA and written out in
+> §3a/§3b. New material: `.ashift`, `tcgen05.ld.red`, the SM103 K=96 FP4 shape, and the
+> SM120 warp-level block-scaled path.
+
 ---
 
 ## Bottom line for our system
 
-- **Our dense GEMM at C1 is not FLOP-limited and tcgen05 peak is irrelevant to it.**
-  `nvjet_sm100_tst_64x8_...` (12.6% of all GPU time) has an 8-wide N tile. With `T`
-  tokens per forward, decode GEMM arithmetic intensity is `2T` FLOP/byte for FP8 weights;
-  B200 machine balance is `4.5 PFLOP/s ÷ 7.7 TB/s = 584` FLOP/byte, so you need
-  **T ≳ 292 tokens** to be compute-bound in FP8 and **T ≳ 329** in NVFP4. At C1 with
-  EAGLE 3-1-4 we have T ≈ 8. We are ~40× off the tensor-core roofline. [inferred, arithmetic below]
-- **`bmm_E2m1_E2m1E2m1_Fp32_Ab16_Bb16_Cb16_t128x8x5...swiGlu_dynB_sm100f` is almost
-  certainly `tcgen05.mma.cta_group::?.kind::mxf4nvf4.block_scale.block16`** — the `b16`
-  triple is the NVFP4 scale-vector size 16, which only `.kind::mxf4nvf4` + `.block16`
-  supports. The `Cb16` says the epilogue re-quantizes the output to NVFP4 in-kernel.
-  [inferred, corroborated by `sf_vec_size = mDtypeWeights == MxE2m1 ? 32 : 16` at
-  `trtllm_fused_moe_kernel_launcher.cu:1988`]
+- **Our dense GEMM (37.1% of GPU time) is not FLOP-limited at C1, so tcgen05 peak is
+  irrelevant to it.** `nvjet_sm100_tst_64x8_...` (12.6% on its own) has an 8-wide N tile.
+  With `T` tokens per forward, decode GEMM arithmetic intensity is `2T` FLOP/byte for FP8
+  weights; B200 machine balance is `4.5 PFLOP/s ÷ 7.67 TB/s = 587` FLOP/byte, so you need
+  **T ≳ 293 tokens** to be compute-bound in FP8 and **T ≳ 330** in NVFP4. At C1 with
+  EAGLE 3-1-4 we have T ≈ 8. We are ~40× off the tensor-core roofline. Nothing in this
+  document raises C1 dense throughput; only reducing weight bytes or raising `T` does.
+  [inferred; peaks and 7.67 TB/s both verified below]
+- **The single largest tcgen05-shaped opportunity in our profile is not a GEMM at all —
+  it is the 9.2% of GPU time that is rank arrival skew** (47% of the 19.6% collectives
+  bucket). `tcgen05.mma` is a *single-thread, fire-and-forget* async op whose completion is
+  an mbarrier arrival, and issue costs one instruction per ~128 clocks (§6). There is
+  therefore no structural reason the tensor core must be idle while a rank waits on
+  `oneshotAllreduceFusionKernel`. Capturing it means a persistent CTA that holds its TMEM
+  allocation across the AR wait — and that CTA must call
+  `tcgen05.relinquish_alloc_permit` or it blocks SM turnover for everyone (§2). [inferred;
+  the async/issue-cost properties are verified from PTX ISA §9.7.17.10 and Table 49]
+- **`bmm_E2m1_E2m1E2m1_Fp32_Ab16_Bb16_Cb16_t128x8x5...swiGlu_dynB_sm100f` (MoE, 19.4%
+  bucket) is forced to be `tcgen05.mma.cta_group::N.kind::mxf4nvf4.block_scale.block16`.**
+  Not "probably": `.block16` accepts **`.kind::mxf4nvf4` and nothing else** — verified from
+  the CCCL header's parameter type (`kind_mxf4nvf4_t`, no template over kind) and from
+  PTX ISA Table 60. The `b16` triple is the NVFP4 scale-vector size 16; `Cb16` says the
+  epilogue re-quantizes the output to NVFP4 in-kernel. The `sm100f` suffix also pins the
+  spelling: the arch-*family* target only exists for `.block16`, not for the older
+  `.scale_vec::4X` (§3). [verified]
+- **The MoE expert GEMMs are already on the fastest instruction NVIDIA ships.** There is no
+  instruction-level upgrade available for that 19.4%; the only headroom is tiling,
+  pipelining and routing overhead. [inferred from the verified `.kind` throughput table]
 - **The "2× throughput" of the FP4 path is `.kind::mxf4`/`.kind::mxf4nvf4` vs
   `.kind::mxf8f6f4`, NOT `.block16` vs `.block32`.** Both block16 and block32 forms of
   `mxf4nvf4` run at the same rate. What buys the 2× is that instruction-K doubles from
   32 to 64, and the price is: A and B **both** E2M1, **both K-major** (no MN-major /
-  transposed operand), and M fixed at 128 for `cta_group::1`. [verified: CuTeDSL
-  `MmaMXF4Op`/`MmaMXF4NVF4Op` `instruction_k = 64` vs `MmaMXF8F6F4Op` `instruction_k = 32`]
+  transposed operand), and M fixed at 128 for `cta_group::1`. [verified: PTX ISA Table 42
+  gives K=32 for `.kind::mxf8f6f4` and K=64 for `.kind::mxf4`/`.kind::mxf4nvf4`]
 - **Block-scaled MMA has no M=64 mode on `cta_group::1`** — M must be 128 (or 128/256 for
   `cta_group::2`). For a token-minor decode GEMM this means you either waste 120/128 rows
   or you swap A and B so tokens land on N (which has an 8 granularity). The
   `...SwapsAbForGen` in our `parseP1MultiCtasKvVarSeqQ8Kv128StaticSwapsAbForGen`
-  attention kernel is exactly this trick. [verified for the shape constraint; the kernel
-  naming reading is inferred]
+  attention kernel (6.0% at C1, part of the 10.9% attention bucket) is exactly this trick.
+  [verified for the shape constraint, PTX ISA Table 42; the kernel naming reading is inferred]
 - **TMEM is the hard occupancy limit for FP4 GEMM.** A 128×256 FP32 accumulator is 256 of
   512 TMEM columns; add SFA (16) + SFB (32) for block16 and you are at 304, which rounds
   up to a 512-column allocation → **one CTA per SM**. 128×128 fits in 256 columns → two
@@ -48,13 +75,27 @@ Where a widely-repeated claim is wrong or unsourceable, it is called out as such
   NVIDIA sized K per kind so the instruction duration is constant. Your mainloop must
   supply 96 B/clk of A+B from SMEM (plus ~12 B/clk of scale factors for NVFP4) to keep the
   pipe full. [inferred, arithmetic below]
-- **SM120 (consumer Blackwell) has no tcgen05 and no TMEM.** Our gates must key on
-  SM100/SM103, not `major >= 10` — this is already noted in
-  `/home/aman/code/NotSglang/glm-kernels/include/glm/glm_abi.h:40`. [verified]
+- **SM120 (consumer Blackwell) has no tcgen05 and no TMEM — but it does have block-scaled
+  FP4, at warp level.** `mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X`
+  requires `sm_120a`/`sm_120f` and is **not available on sm_100**. So the two families need
+  genuinely different kernels, not a shape switch. Our gates must key on SM100/SM103, not
+  `major >= 10` — already noted in `/home/aman/code/NotSglang/glm-kernels/include/glm/glm_abi.h`
+  (the `glm_arch_t` comment). [verified, PTX ISA §9.7.15 Target ISA Notes]
+- **Blackwell Ultra (SM103) gets a K=96 FP4 MMA that B200 does not.** `.kind::mxf4` /
+  `.kind::mxf4nvf4` with K=96 is `sm_103a`-only, `cta_group::2`, M=256. That is 1.5× the
+  MACs per instruction at the same instruction footprint — the hardware basis of the
+  "1.5× dense FP4" Blackwell-Ultra claim. Any per-instruction arithmetic in this document
+  is **SM100-specific**. [verified, PTX ISA §9.7.17.2.1.1 + Table 59]
 - **Open, and it matters: we have not verified whether SM100 FP8/FP4 MMA needs
   DeepGEMM-style FP32 promotion.** On Hopper the FP8 wgmma accumulator was effectively
-  narrower than FP32 and DeepSeek promoted every 128 K-elements. I could not source
-  whether SM100 fixed this. See §11 for a measurement recipe.
+  narrower than FP32 and DeepSeek promoted every 128 K-elements. The PTX ISA §9.7.17 text
+  says **nothing** about the internal accumulation width — I read the whole section and
+  confirmed the absence. See §14 for a measurement recipe.
+- **Calibration for the 365 → 500 tok/s target.** A tuned public NVFP4 grouped GEMM on this
+  class of hardware reaches ~50% of tensor-core peak end-to-end (~80% in the steady-state
+  mainloop) at 12.4% occupancy. [reported] Treat 50–60% of FP4 peak as the realistic
+  ceiling for our MoE GEMMs; the remaining 1.37× has to come from the collectives bucket
+  and from raising `T`, not from the tensor core.
 
 ---
 

@@ -70,6 +70,25 @@ was produced by assembling probe kernels with the local `ptxas` 13.3.73.
   projection, not a separate kernel. That removes the launch, removes the
   round-trip through HBM, and lets the reduction start on the first finished
   tile. [verified: `tilert/models/glm_5/_dsa_v32/ops/*_allreduce.py`]
+- **[AUDIT] TBO is not the fix for our C1 number, and the earlier draft was wrong
+  to say so.** Our own ledger states it plainly: "At concurrency 1 there is no
+  batch to split, so TBO cannot help the latency mode *even if unblocked*."
+  Unblocking TBO is worth doing for C16/C64, but the C1 → 500 tok/s path is
+  tile-level overlap (TileRT-style fused epilogue AR) and fixed-cost reduction.
+  [verified: `hotspots-and-optimization-ledger.md:158-162`]
+- **[AUDIT] The 47% skew number is measured over a window that is not pure C1
+  decode.** `twoshotAllreduceKernel` is 4.3% of device-0 kernel time, and by
+  FlashInfer's own threshold two-shot *cannot* be selected at 4 tokens — so the
+  window contains prefill (or larger token counts). The 15.4 µs per-instance
+  average therefore blends small decode ARs with large prefill ARs. The ratio
+  (47% waiting) is still the right headline; the absolute µs are an average over
+  a mixed population. [inferred from `trtllm_mnnvl_ar.py:44` + ledger kernel table]
+- **The switch can reduce FP8 natively, and nobody in our stack uses it.**
+  `multimem.ld_reduce...add.v4.e4m3x4` assembles on sm_100a and lowers to a real
+  `LDGMC.E.ADD.E4M3x16.RN.STRONG.SYS` opcode (§2.3). Our AR payload is bf16; an
+  e4m3 AR would halve NVLink bytes and halve the Lamport workspace. Useless at
+  C1 (we are latency-bound, not byte-bound) but directly relevant to the C64
+  two-shot path, which moves ~3 MiB/rank. [verified: local `ptxas`/`nvdisasm`]
 
 ---
 
@@ -117,7 +136,15 @@ The 16/17 ratio is exactly the same one H100/NVLink4 shows (26.5625 GB/s raw per
 link, 25 GB/s payload), so it is the NVLink framing overhead, not a Blackwell
 quirk. [inferred] The specific lane organisation (how 53.125 GB/s decomposes
 into lanes and baud rate) — **not sourced**; do not repeat a lane count you
-cannot cite.
+cannot cite. What *is* forced by arithmetic: 53.125 GB/s = 425 Gb/s of raw
+signalling per link per direction, and 425 = 2 x 212.5, so a 2-lane-per-direction
+link at 212.5 Gb/s per lane is consistent — but "2 lanes" is [inferred], not
+sourced, and NVIDIA has never confirmed it in a document I could fetch.
+
+`nvidia.com/en-us/data-center/nvlink` gives only two numbers for the fifth
+generation: "Maximum Number of Links per GPU: 18" and "NVLink Bandwidth per GPU:
+1,800GB/s" [verified, fetched 2026-08-17]. Everything else in the table above is
+arithmetic on those two plus the driver's per-link rate.
 
 HGX B200 board-level, from nvidia.com/en-us/data-center/hgx [verified]:
 8 Blackwell SXM, **1.4 TB HBM3e**, **14.4 TB/s** total NVLink bandwidth
@@ -125,12 +152,26 @@ HGX B200 board-level, from nvidia.com/en-us/data-center/hgx [verified]:
 
 ### 1.3 NVSwitch on an HGX B200 baseboard
 
+**[AUDIT] The previous version of this section attributed "72 ports, 14.4 TB/s"
+to the NVLink Switch *chip*. That is wrong.** 14.4 TB/s is the number NVIDIA
+publishes for the whole **HGX B200 baseboard** (8 x 1.8 TB/s), verified on
+nvidia.com/en-us/data-center/hgx. Neither the NVLink page nor the HGX page states
+a per-chip port count or per-chip bandwidth for the Blackwell switch; the NVLink
+page's only aggregate figure is "Total Aggregate Bandwidth: 130 TB/s (NVL72)"
+[verified, fetched 2026-08-17]. Treat per-chip specs as unsourced.
+
 - The HGX B200 baseboard carries **two NVSwitch ASICs**, with **9 of each GPU's
-  18 links going to each switch**. [reported: ServeTheHome / FiberMall coverage
-  of the HGX B200 baseboard; I could not get this out of an NVIDIA primary doc]
-- NVLink Switch (Blackwell generation) is quoted at **72 NVLink 5 ports** per
-  chip and **14.4 TB/s** non-blocking switching. [reported, same class of
-  sources]
+  18 links going to each switch**. [unverified — widely repeated by
+  ServeTheHome/FiberMall-class coverage; I could not obtain it from an NVIDIA
+  document, and I am not citing a URL I did not read]
+- The arithmetic that makes that plausible, and which you *can* rely on:
+  8 GPUs x 18 links = **144 GPU-side links** must terminate somewhere. If the
+  Blackwell switch chip has 72 NVLink 5 ports (the commonly quoted figure, also
+  [unverified]), then exactly **two** chips absorb 144 links with nothing left
+  over, and each GPU necessarily contributes 9 links to each. A per-chip
+  bidirectional capacity of 72 x 100 GB/s = **7.2 TB/s** then makes two chips
+  sum to the 14.4 TB/s NVIDIA does publish. The consistency is suggestive, not
+  proof. [inferred, arithmetic]
 - Consequence for us: **every pair is one switch hop, and the fabric is
   non-blocking.** There is no "near" and "far" GPU. Bisection is the full
   8 x 900 GB/s = 7.2 TB/s each way. A single pair doing a plain P2P copy can in
@@ -168,10 +209,10 @@ I could **not** source an authoritative NVLink 5 point-to-point latency figure
 from NVIDIA. Treat any specific nanosecond number you see repeated on blogs as
 unverified. What can be said:
 
-- nccl-tests `all_reduce_perf -b 4 -e 8G` with `NCCL_ALGO=NVLS` on 8 GPUs shows
-  **~24 µs for an 8-byte message** [reported, from NVIDIA/nccl issue #2077
-  transcript]. That is a *floor for NCCL*, not for the fabric: it includes NCCL
-  kernel launch, the LL/NVLS protocol handshake and the test harness.
+- **[AUDIT] A previous draft cited "~24 µs for an 8-byte NVLS allreduce, from
+  NVIDIA/nccl issue #2077". I fetched that issue. It contains no nccl-tests
+  numbers of any kind.** The claim is withdrawn — do not repeat it. There is no
+  sourced NCCL small-message latency figure in this document.
 - Our own measurement is the better anchor: the trtllm MNNVL one-shot kernel,
   48 KiB per rank, TP8, **~8.2 µs of "transfer" (= duration of the last-arriving
   rank) and ~7.2 µs of waiting**, per rank per allreduce. [verified: our nsys
@@ -188,15 +229,25 @@ one-shot, multicast publish:
   NVLink egress per rank    = 48 KiB                     (switch replicates)
   NVLink ingress per rank   = 7 x 48 KiB = 336 KiB
   ingress time @ 900 GB/s   = 336 KiB / 900e9            = 0.37 µs
-local reduce read           = 8 x 48 KiB = 384 KiB from HBM
-  @ ~7.5 TB/s STREAM-triad  = 384 KiB / 7.5e12           = 0.05 µs
+local reduce read           = 7 x 48 KiB = 336 KiB from HBM
+  @ ~7.5 TB/s STREAM-triad  = 336 KiB / 7.5e12           = 0.04 µs
 --------------------------------------------------------------------
-floor                                                    ~= 0.42 µs
+floor                                                    ~= 0.41 µs
 observed                                                 ~= 15.4 µs
 ```
 
-(The 7.48 TB/s STREAM triad figure for B200 is [verified] from the Blackwell
-microbenchmark paper, arXiv 2512.02189 overview.)
+**[AUDIT]** The reduce term is 7 slots, not 8: `pollOneshotRemoteRank` short-
+circuits `if constexpr (Rank == LocalRank) return true;` and the kernel keeps its
+own contribution in registers (`packedAccum = val`), so the local slot is never
+re-read from memory. [verified: `trtllm_mnnvl_allreduce.cuh:456-470, 961-963`]
+The conclusion is unchanged — the correction is 0.01 µs out of 15.4 µs.
+
+(The **7.48 TB/s** STREAM-triad figure for B200 is [verified] — I read it in the
+paper's own HTML: "Microbenchmarking NVIDIA's Blackwell Architecture: An in-depth
+Architectural Analysis", Jarmusch & Chandrasekaran, arXiv 2512.02189, which
+reports B200 at 7.48 TB/s vs H200 at 4.38 TB/s on large arrays. The previous
+draft cited an alphaxiv summary page for this; the arXiv HTML is the primary
+source and is what is cited now.)
 
 So **97% of the allreduce cost at C1 is not data movement.** Everything in §6 is
 about the other 97%.
@@ -275,10 +326,29 @@ CUresult cuMulticastAddDevice(CUmemGenericAllocationHandle mcHandle,
 CUresult cuMulticastBindMem(CUmemGenericAllocationHandle mcHandle, size_t mcOffset,
                             CUmemGenericAllocationHandle memHandle, size_t memOffset,
                             size_t size, unsigned long long flags);   /* :14325 */
-CUresult cuMulticastBindAddr(...);  CUresult cuMulticastUnbind(...);
+CUresult cuMulticastBindAddr(...);                                  /* :14448 */
+CUresult cuMulticastUnbind(CUmemGenericAllocationHandle mcHandle,
+                           CUdevice dev, size_t mcOffset, size_t size); /* :14546 */
 CUresult cuMulticastGetGranularity(size_t*, const CUmulticastObjectProp*,
-                                   CUmulticastGranularity_flags);
+                                   CUmulticastGranularity_flags);   /* :14571 */
+
+/* NEW in this toolkit and absent from the previous draft: the _v2 binds take an
+   explicit CUdevice instead of implying it from the current context. */
+CUresult cuMulticastBindMem_v2(CUmemGenericAllocationHandle mcHandle, CUdevice dev,
+                               size_t mcOffset, CUmemGenericAllocationHandle memHandle,
+                               size_t memOffset, size_t size,
+                               unsigned long long flags);            /* :14392 */
+CUresult cuMulticastBindAddr_v2(CUmemGenericAllocationHandle mcHandle, CUdevice dev,
+                                size_t mcOffset, CUdeviceptr memptr, size_t size,
+                                unsigned long long flags);           /* :14511 */
 ```
+
+The header also documents exactly which failures a bind can produce, which is
+what makes the 128-slot story in §2.5 legible: `cuMulticastBindMem` "will return
+CUDA_ERROR_OUT_OF_MEMORY if there are insufficient resources required to perform
+the bind", plus `CUDA_ERROR_SYSTEM_NOT_READY` (fabric software not up) and
+`CUDA_ERROR_ILLEGAL_STATE` (system configuration bad / driver daemon missing).
+[verified: `cuda.h:14290-14325`]
 
 Sequence: create the object with `numDevices` set -> `cuMulticastAddDevice` for
 **all** devices (must complete before any bind) -> each device allocates normal
@@ -321,9 +391,12 @@ Three instructions, all taking a **multicast** address in `.global`:
 | `multimem.red` | reduce-into-all (no return value) |
 | `multimem.ld_reduce` | gather+reduce in the switch, return one value |
 
-I could not get the PTX ISA section 9.7.9.15 grammar to render through
-WebFetch — **the qualifier/type matrix is not sourced from the ISA doc**. But
-the exact forms in production use are verified locally:
+**[AUDIT] The previous draft gave up here** ("the qualifier/type matrix is not
+sourced"). docs.nvidia.com still renders only the ToC for §9.7.9.15 through
+WebFetch, but the ISA doc is not the only primary source: **`ptxas` itself is
+authoritative for what this toolchain accepts**, and `nvdisasm` is authoritative
+for what it lowers to. §2.3.1 and §2.3.2 below are the matrix, obtained that way.
+First, the forms in production use in our tree:
 
 `torch/include/torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemory-inl.h`
 [verified]:
@@ -353,8 +426,133 @@ Two design facts worth internalising:
 - `.acc::f32` on a `bf16x2`/`f16x2` ld_reduce means the **switch accumulates in
   fp32** and returns bf16/fp16. That is why NVLS allreduce is not bit-identical
   to a local fp32 tree reduce but is *better* than naive bf16 accumulation.
+  (§2.3.2 confirms this in SASS: the opcode carries an explicit `.RN` rounding
+  mode on the narrowing step.)
 - `multimem.red` with `.add.u32` is the canonical **multicast barrier/signal**:
   one instruction increments a counter on all peers.
+
+### 2.3.1 The qualifier/type matrix, verified by assembling it
+
+Method: emit a minimal `.target sm_100a` kernel containing one candidate
+instruction and run `/home/aman/code/cuda-13.3/nvidia/cu13/bin/ptxas` (13.3.73,
+built 2026-06-09). Accepted = the form exists in this toolchain; rejected forms
+are reported with `ptxas`'s own diagnostic, which is often more informative than
+the ISA doc. All rows below are **[verified: local ptxas 13.3.73]**.
+
+Version/target gating:
+
+| probe | result |
+|---|---|
+| `.version 8.0` | `Feature 'multimem.ld_reduce' requires PTX ISA .version 8.1 or later` |
+| `.target sm_80` | `Feature 'multimem.ld_reduce' requires .target sm_90 or higher` |
+| max `.version` accepted by this ptxas | **9.3** (9.4 aborts) |
+
+`multimem.ld_reduce.<sem>.<scope>.global.<op>[.acc::f32][.vec].<type>`:
+
+| qualifier | accepted values | notes |
+|---|---|---|
+| `.sem` | `.weak`, `.relaxed`, `.acquire` | `.weak` takes no `.scope` |
+| `.scope` | `.cta`, `.cluster`, `.gpu`, `.sys` | required for `.relaxed`/`.acquire` |
+| `.op` | `.add`, `.min`, `.max`, `.and`, `.or`, `.xor` | `.min`/`.max`/bitwise are integer- and packed-half-only |
+| `.acc::f32` | only with `.f16x2` / `.bf16x2` | `.acc::f16` is **rejected**; there is no other accumulator qualifier |
+| `.vec` | `.v2`, `.v4` — **float/packed types only** | `.v2.u32`/`.v4.u32` → *"Vector qualifier is not allowed"*; `.v2.f64` → *"Inconsistent type"* |
+| state space | `.global` or generic (both assemble) | production code always uses `.global` |
+
+Type support for `multimem.ld_reduce`:
+
+| type | `.add` | `.min`/`.max` | `.and`/`.or`/`.xor` | `.acc::f32` | `.v2`/`.v4` |
+|---|---|---|---|---|---|
+| `.f32` | yes | **no** (*"Incorrect type '.f32' for operation '.min'"*) | no | n/a | yes |
+| `.f64` | yes | no | no | n/a | **no** |
+| `.f16x2`, `.bf16x2` | yes | yes | no | yes | yes |
+| `.e4m3x4`, `.e5m2x4` | yes | not probed | no | **rejected** | yes |
+| `.u32`, `.s32`, `.b32` | yes | yes | yes | n/a | **no** |
+| `.u64`, `.s64`, `.b64` | yes | yes | yes | n/a | **no** |
+| `.f16`, `.bf16` (scalar) | **rejected** — *"Unexpected instruction types"* | | | | |
+
+**The FP8 rows are the find.** `.e4m3x4` / `.e5m2x4` are **not** in the
+`libcu++`/CCCL wrapper (nvidia.github.io/cccl lists only `u32/s32/b32/u64/s64`
+for `multimem.ld_reduce`), are not used anywhere in FlashInfer, PyTorch symmetric
+memory or SGLang in this tree, and are gated to arch-specific targets:
+
+| target | `.e4m3x4` accepted? |
+|---|---|
+| `sm_90a` | no — *"Feature '.e4m3x4' not supported on .target 'sm_90a'"* |
+| `sm_100` | **no** |
+| `sm_100a`, `sm_100f`, `sm_103a`, `sm_110a`, `sm_120a` | **yes** |
+| minimum `.version` | **8.6** |
+
+So FP8 in-switch reduction is a Blackwell-and-later, `a`/`f`-target-only feature.
+Compiling for plain `sm_100` silently loses it. Our JIT cache directory is
+`~/.cache/flashinfer/0.6.15.post1/**100a**/`, so we are already on a target that
+could use it. [verified]
+
+`multimem.st.<sem>.<scope>.global[.vec].<type>`:
+
+| aspect | result |
+|---|---|
+| scalar types accepted | `.b32 .b64 .u32 .s32 .f32 .f64 .f16x2 .bf16x2` |
+| `.b16` | **rejected** — 32-bit is the minimum granularity |
+| vector forms accepted | `.v2.f32`, `.v4.f32`, `.v4.f16x2`, `.v4.e4m3x4` |
+| `.v4.b32`, `.v4.u32`, `.v4.b64`, `.v8.b32` | **rejected** — *"Vector qualifier is not allowed"* |
+
+That last row explains a real coding idiom: **every 128-bit multicast store in
+our stack is spelled `.v4.f32` even when the payload is bf16.** PyTorch, Triton
+and FlashInfer all do this. It is not sloppiness — `.v4.b32` does not assemble.
+Bit-reinterpret to `float4` and store as `.v4.f32`.
+
+`multimem.red` mirrors `ld_reduce` (same `.op`/`.acc::f32`/vector rules) with one
+exception: **`.e4m3x4` is rejected for `multimem.red`** (*"Unexpected instruction
+types specified for 'multimem.red'"*) while accepted for `ld_reduce` and `st`.
+FP8 works for gather-reduce and for broadcast, but not for fire-and-forget
+reduce-into-all.
+
+### 2.3.2 What it lowers to on sm_100a (SASS)
+
+Assembled with `ptxas -arch=sm_100a` and disassembled with `nvdisasm -c`
+[verified, local, 2026-08-17]:
+
+| PTX | SASS |
+|---|---|
+| `multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2` | `LDGMC.E.HPADD.BF16x8.RN.STRONG.SYS` |
+| `multimem.ld_reduce.relaxed.sys.global.add.v4.e4m3x4` | `LDGMC.E.ADD.E4M3x16.RN.STRONG.SYS` |
+| `multimem.ld_reduce.relaxed.sys.global.min.bf16x2` | `LDGMC.E.MIN.BF16x2.RN.STRONG.SYS` |
+| `multimem.st.relaxed.sys.global.v4.f32` | `STG.E.128.STRONG.SYS` |
+| `multimem.red.relaxed.sys.global.add.u32` | `VOTEU.ANY / UFLO / UPOPC / IMAD` then `@P0 REDG.E.ADD.STRONG.SYS` |
+
+Four things follow, none of which are in any doc I could find:
+
+1. **`LDGMC` is a real, distinct opcode** — "LoaD Global MultiCast". The reduce
+   is encoded in the instruction (`HPADD` = packed-half add, `ADD` for FP8/int),
+   the element count is in the type suffix (`BF16x8` = 16 bytes = 8 bf16,
+   `E4M3x16` = 16 bytes = 16 fp8), and `.RN` is the round-to-nearest applied when
+   the fp32 accumulator is narrowed back down. This is the hardware confirmation
+   of the `.acc::f32` semantics.
+2. **`multimem.st` is not a special instruction at all.** It lowers to a plain
+   `STG.E.128.STRONG.SYS`. Multicast is a property of the *virtual address*, not
+   of the store — the MC mapping created by `cuMulticastBindMem` is what makes
+   the switch replicate. Practical consequence: a multicast store costs exactly
+   what a normal 128-bit global store costs on the issue side, and you cannot
+   make it cheaper by choosing a different opcode. All the cost is downstream.
+3. **`.acquire` costs an L1 invalidate; `.relaxed` and `.weak` cost nothing.**
+   `multimem.ld_reduce.acquire.sys...` emits an extra `CCTL.IVALL` after the
+   `LDGMC`. `.relaxed.sys`, `.relaxed.gpu`, `.relaxed.cta` and `.weak` all emit
+   the bare `LDGMC` with no fence. Use `.relaxed` in the spin loop and pay for
+   ordering once, explicitly.
+4. **`.release` on `multimem.red` is expensive and the cost is a full system
+   membar.** `multimem.red.release.sys.global.add.u32` emits
+   `@P0 MEMBAR.ALL.SYS ; @P0 ERRBAR ; @P0 CGAERRBAR ;` *before* the `REDG`.
+   `.relaxed.sys` emits none of that. FlashInfer's `mixed_comm.cuh` uses
+   `multimem.red.release.sys` for its signal — correct, but note you are buying a
+   system-scope membar per arriving warp, which is exactly the kind of fixed cost
+   that dominates our 8.2 µs (§6.1).
+
+Also visible in that listing: **ptxas warp-aggregates `multimem.red` when every
+lane targets the same address** — `VOTEU.ANY` / `UFLO` (find leader) / `UPOPC`
+(count participants) / `IMAD` (scale the value by the count) / `@P0 REDG`. One
+switch transaction per warp instead of 32. If your barrier counter is per-CTA,
+you are already getting this for free; if you hand-roll a "only thread 0
+signals" guard, you are not gaining anything ptxas was not already doing.
 
 ### 2.4 Where NVLS wins, and where it doesn't
 
@@ -362,16 +560,25 @@ Two design facts worth internalising:
   For an 8-rank allreduce it turns 7S of ingress into ~1.75S (two-shot with
   `RSxLDMC_AGxSTMC`) or 1S of egress (one-shot broadcast). Below ~100 KiB the
   fixed cost swamps that.
-- NVLS register-path bandwidth is the *worst* of the three data paths (541 GB/s,
-  60%) per the Hazy measurement. NVLS wins on *volume moved*, not on link
-  utilisation.
-- Reported field data: on an NVLink testbed with NCCL 2.29.7, NVLS was the
-  default at all sizes but **Ring with 32 channels beat NVLS by 5-27% in the
-  4-128 MiB range**, with NVLS only clearly ahead at >=256 MiB. [reported:
-  NVIDIA/nccl issue #2077 thread] Do not assume NVLS is free.
+- Register-path bandwidth is the *worst* of the three data paths (541 GB/s, 60%)
+  per the Hazy measurement. Note their row is labelled "Register Operations"
+  generically; attributing that specific 541 GB/s to `multimem.ld_reduce` in
+  particular is [inferred], not what the blog says. NVLS wins on *volume moved*,
+  not on link utilisation.
+- **[AUDIT] A previous draft claimed "Ring with 32 channels beat NVLS by 5-27%
+  in the 4-128 MiB range", sourced to NVIDIA/nccl issue #2077. I fetched that
+  issue; it contains no such benchmark.** Claim withdrawn. The general caution
+  ("do not assume NVLS is free") stands on the bandwidth argument alone: NVLS
+  buys you bytes, and bytes only matter above the latency floor.
 - NVIDIA's own claim for NCCL 2.27 symmetric-memory kernels: **up to 9x lower
   latency at small sizes**, and on an NVL8 domain (= our box) **up to 2.5x for
-  small-to-medium messages**. [reported: developer.nvidia.com NCCL 2.27 blog]
+  small-to-medium messages**. [reported: developer.nvidia.com NCCL 2.27 blog,
+  re-fetched and confirmed 2026-08-17]
+- Also from that blog, and more useful than the speedup multipliers: NVLink SHARP
+  offload for **AllGather and ReduceScatter** cuts NCCL's SM usage from **16 SMs
+  to 6 SMs per GPU**. That is the concrete "SHARP saves SMs" number, and it is an
+  argument for NVLS on the *LM-head all-gather*, not on the TP allreduce.
+  [reported: same blog]
 
 ### 2.5 Slot limits, Fabric Manager, IMEX
 

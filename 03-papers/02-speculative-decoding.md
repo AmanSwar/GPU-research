@@ -330,9 +330,9 @@ each padded request costs `num_draft_tokens` wasted token-slots rather than 1.
 | EAGLE | Li, Wei, Zhang, Zhang (PKU/MSRA/Waterloo) | **ICML 2024**, arXiv 2401.15077 | A100-40G ×4, RTX3090 | Vicuna-13B 3.13×, τ=3.98; LLaMA2-70B 2.7–3.5×, τ=3.81 `[verified]` | vLLM, SGLang, TRT-LLM |
 | EAGLE-2 | same | **EMNLP 2024**, arXiv 2406.16858 | as EAGLE | Vicuna-13B 4.26×, τ=4.83 `[verified]` | SGLang (`EAGLE`), vLLM |
 | EAGLE-3 | same | **NeurIPS 2025**, arXiv 2503.01840 | H100 (SGLang), A100/3090 (vLLM) | Vicuna-13B 5.51×, τ=6.62 mean; LLaMA-3.3-70B 4.12×, τ=5.88 `[verified]` | SGLang (`EAGLE3`), vLLM |
-| HASS | Zhang, Wang, Huang, Xu (Xiaohongshu) | **ICLR 2025**, arXiv 2408.15766 | not stated in abstract | 2.81–4.05× on LLaMA; +8–20% over EAGLE-2 `[reported]` | SpecForge training recipes |
+| HASS | Zhang, Wang, Huang, Xu | **ICLR 2025**, arXiv 2408.15766 | not stated in abstract | 2.81–4.05× on LLaMA; +8–20% over EAGLE-2 `[reported]` | SpecForge training recipes |
 | CORAL | Weng et al. | ACL 2025, arXiv 2502.16880 | — | cross-step representation alignment for multi-step draft training `[reported]` | no |
-| FR-Spec | Zhao, Pan, Han et al. (Tsinghua) | arXiv 2502.14856 | A800 | Llama-3-8B: EAGLE-2 2.03× → 2.27× `[verified]` | SGLang `--speculative-token-map` |
+| FR-Spec | Zhao, Pan, Han, Zhang, Sun, Huang et al. | arXiv 2502.14856 | A800 | Llama-3-8B: EAGLE-2 2.03× → 2.27× `[verified]` | SGLang `--speculative-token-map` |
 | PARD | An, Bai, Liu, Li, Barsoum (AMD) | arXiv 2504.18583 | — | target-independent parallel draft `[reported]` | vLLM (`method: pard`) |
 
 ### 3.1 Medusa — and why it is not lossless

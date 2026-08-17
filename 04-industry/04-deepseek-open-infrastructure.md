@@ -12,23 +12,34 @@ implementations, GitHub PR bodies via the API). Every technical claim below is t
 - **[inferred]** — my own reasoning applied to their disclosures, aimed at our 8×B200 stack.
 - **[unverified]** — I could not source it.
 
-Research date: 2026-08-17. Scope covers Open Source Week (Feb 2025) through the DeepSeek-V4
-series (Apr–Aug 2026), including material that post-dates most people's mental model of
-DeepSeek: **DeepEP V2**, **DeepGEMM Mega MoE**, **TileKernels**, **LPLB**, **Engram**,
-**DeepSpec/DSpark**, and the **DeepSeek-V4 technical report**.
+Research date: 2026-08-17. **This document has been through a second, adversarial verification
+pass**: every URL below was re-fetched, every number re-checked against its primary source, and
+claims that could not be confirmed were deleted or downgraded. Corrections made in that pass are
+marked inline with **[CORRECTED]**. Scope covers Open Source Week (Feb 2025) through the
+DeepSeek-V4 series (Apr–Aug 2026): **DeepEP V2**, **DeepGEMM Mega MoE**, **TileKernels**,
+**LPLB**, **Engram**, **DeepSpec/DSpark**, the **DeepSeek-V4 technical report**, and the
+**V4 production serving configuration**.
 
-Two headline findings that change the picture:
+Three headline findings:
 
 1. **DeepSeek-V4 exists, is released, and is fully documented.** [verified] `DeepSeek-V4-Pro`
    (1.6T total / 49B active) and `DeepSeek-V4-Flash` (284B / 13B), both 1M context, MIT
    licensed, on HuggingFace with a reference implementation, plus an arXiv technical report
-   (2606.19348). The assignment asked me to "verify whether it exists and say plainly if
-   nothing is" — it exists, and the report contains a full inference-framework section.
-2. **DeepSeek's public reference kernels have moved from CUDA/CUTLASS to TileLang.** [verified]
-   The V4 reference `inference/kernel.py` is TileLang (`tilelang==0.1.8`), and they released a
-   dedicated TileLang kernel library (`TileKernels`). This is directly relevant to the TileRT
-   threat model — the "tile-level DSL beats hand-written CUTLASS for iteration speed" bet is
-   being made by DeepSeek too.
+   (2606.19348, title confirmed: *"DeepSeek-V4: Towards Highly Efficient Million-Token Context
+   Intelligence"*). The current production checkpoints are `DeepSeek-V4-Pro-0813` (2026-08-13)
+   and `DeepSeek-V4-Flash-0731` (2026-08-01).
+2. **DeepSeek publishes its own production serving command lines, for both vLLM and SGLang, and
+   they are Blackwell-generation configs.** [verified, NEW in this pass] This is the single most
+   actionable thing in the corpus and the first pass missed it entirely. It names
+   `--moe-backend deep_gemm_mega_moe`, `--speculative-algorithm DSPARK`, FP4 indexer cache,
+   `--block-size 256`, and a 4×GB300 target. Full detail in
+   *"What DeepSeek actually ships"* below.
+3. **DeepSeek's public reference kernels have moved from CUDA/CUTLASS to TileLang.** [verified]
+   They released a dedicated TileLang kernel library (`TileKernels`, SM90/SM100, CUDA 13.1+),
+   and the V4 report §3.2 describes replacing "hundreds of fine-grained Torch ATen operators"
+   with TileLang fused kernels. This is directly relevant to the TileRT threat model — the
+   "tile-level DSL beats hand-written CUTLASS for iteration speed" bet is being made by
+   DeepSeek too.
 
 A caution on the whole corpus: **DeepSeek's published operating point is the opposite of
 ours.** Their flagship disclosure serves users at 20–22 output tok/s at enormous concurrency
@@ -42,21 +53,51 @@ decoding scheduler, and their hardware bottleneck analysis. I flag this per tech
 ## Bottom line for our system
 
 Ranked by expected value on our two objectives (min single-stream latency at C1; min cost/user
-at C64), with the measured hotspot each attacks.
+at C64). Every row names the **specific change to an SGLang-derived engine on 8×B200**, so this
+is a work list, not a reading list.
 
-| # | Steal | Attacks | Expected effect | Difficulty |
-|---|---|---|---|---|
-| 1 | **DP attention instead of TP8 for the DSA/MLA decode path** | attention 10.9% + collectives 19.6% | Restores compute-bound MLA decode (8× arithmetic intensity per rank) and deletes a per-layer all-reduce. Plausibly the single biggest structural win. | High (engine surgery), but SGLang already has `--enable-dp-attention` and DeepSeek ships it in their own launch line |
-| 2 | **Mega-MoE style fused dispatch→GEMM→SwiGLU→GEMM→combine megakernel** | MoE GEMMs 19.4% + collectives 19.6% | DeepSeek report **1.96× at batch size 1** on a 256-expert/top-6 config, EP8, SM100. Batch size 1 *is* our C1 regime. | High — but DeepGEMM is MIT, SM100-native, TMEM-based |
-| 3 | **Confidence-scheduled, load-adaptive speculative verification length** (DSpark) | the 4.7× per-stream falloff C1→C16 | DeepSeek report +60–85% per-user tok/s at matched throughput vs a static MTP-1 baseline in V4 production. Directly targets our C1↔C16 Pareto. | Medium for the scheduler alone; High if we also train a confidence head |
-| 4 | **FlashMLA "seesaw" schedule + fine-grained TMA↔GEMM pipelining + `EVICT_FIRST` + PDL + tile scheduler** | attention 10.9%, dense GEMM 37.1% | Took their dense MLA decode from 580→660 TFLOPS on H800; the techniques (esp. PDL and cache hints) are architecture-portable | Medium |
-| 5 | **Host codegen / kill per-launch CPU overhead** | everything, at TPOT 2.74 ms | DeepSeek report host-side validation dropping from *tens-to-hundreds of µs* to *<1 µs per invocation*. At 2.74 ms TPOT across 60+ layers this is first-order. | Medium |
-| 6 | **Indexer over *compressed* blocks + FP4 QK path + BF16 index scores** | DSA indexer 5.8% | V4 runs the lightning indexer against 1/m-compressed keys, in FP4, and quantizes index scores to BF16 for a claimed **2× top-k selector speedup at 99.7% KV recall** | Medium (kernel) / High (needs retraining for the compressed variant) |
-| 7 | **"Crossover": share dequantized KV between CTAs via distributed shared memory** | attention 10.9% under NVFP4/FP8 KV | Took their FP8 sparse decode from 250→410 TFLOPS on H800 by halving per-CTA dequantization work | Medium-High |
-| 8 | **DeepEP V2 analytical SM budgeting / Hybrid-EP TMA path** | collectives 19.6% | Hybrid-EP reports 409.71 GB/s FP8 dispatch at **16 SMs** on B200 EP8, where baseline DeepEP needs ~44–48 SMs to reach ~544–554 GB/s. SMs returned to GEMM. | Medium |
-| 9 | **Batch-invariant dual-kernel decode (wave-quantization fix)** | collectives 19.6% (47% rank skew) | Their fix for the split-KV-vs-determinism conflict is a *dual kernel* pair that is bitwise identical: one SM/sequence for full waves, multi-SM for the tail wave. Reduces tail variance, which is what rank skew is. | High |
-| 10 | **EPLB redundant experts + LPLB per-batch LP rebalancing** | collectives 19.6% | Only helps at C16+; at C1 with 8 active experts over 8 ranks the imbalance is structural and EPLB cannot fix it. Honest scoping. | Low (EPLB is 130 lines of Python) |
-| 11 | **On-disk KV cache for shared prefixes** | TTFT 189 ms | DeepSeek measured **56.3% of 608B input tokens hitting an on-disk KV cache** in production. Irrelevant to the AA benchmark (fresh prompts), material to real cost/user. | Medium |
+### Tier 0 — do this week, low risk
+
+| # | Steal | Concrete change to our SGLang fork | Attacks | Expected effect | Difficulty |
+|---|---|---|---|---|---|
+| 1 | **Quantize index scores FP32→BF16 before top-k** | One dtype change in the DSA top-k selector kernel, before the sort/select. Validate recall against the FP32 path on our own prompts. | DSA indexer 5.8% | DeepSeek report **2× top-k selector speedup at 99.7% KV recall** [reported, V4 §5.2.1]. Upper bound on our end-to-end gain ≈ 2–3% of C1. | **Low** |
+| 2 | **Turn PDL on between dependent kernels** | `deep_gemm.set_pdl(True)` if we use DeepGEMM; otherwise add `cudaGridDependencySynchronize`/`cudaTriggerProgrammaticLaunchCompletion` to our splitkv→combine and GEMM→norm pairs. | dense GEMM 37.1%, attention 10.9% | DeepSeek use it to overlap `splitkv_mla` with `combine`. Cheap launch-tail recovery at 2.74 ms TPOT. | **Low** |
+| 3 | **`EVICT_FIRST` TMA cache hints + split the K-block TMA into many small copies** | In our MLA/DSA decode kernel: issue a 64×576 K block as **9× 64×64 TMA copies** and start the first GEMM on the first arrival; tag the copies `EVICT_FIRST`. | attention 10.9% | Part of the 580→660 TFLOPS H800 dense-MLA gain; DeepSeek say the cache hint improves L2 hit rate "as shown by experiments". | **Low–Medium** |
+| 4 | **Adopt DeepSeek's own published SGLang flag set as a baseline** | `--moe-runner-backend flashinfer_mxfp4`, `--speculative-algorithm DSPARK`, `--mem-fraction-static 0.90`, `--chunked-prefill-size 4096`, `--swa-full-tokens-ratio 0.1` — see *"What DeepSeek actually ships"*. | everything | Free calibration: these are the flags the model author chose. Note their config is TP4 on GB300, not TP8 on B200 SXM — treat as a starting point, not a target. | **Low** |
+
+### Tier 1 — the structural wins
+
+| # | Steal | Concrete change to our SGLang fork | Attacks | Expected effect | Difficulty |
+|---|---|---|---|---|---|
+| 5 | **DP attention instead of TP8 for the DSA/MLA decode path** | `--enable-dp-attention` (SGLang has it; DeepSeek ship it in their own V3.2 launch line). Costs KV-cache replication across ranks — budget it against 183 GB/GPU. | attention 10.9% + collectives 19.6% | Restores per-rank `h_q = 128`, moving MLA decode from memory-bound to compute-bound, and deletes a per-layer all-reduce. See the crossover arithmetic below — this is the load-bearing argument in the whole corpus. | **High** (engine surgery + memory budget) |
+| 6 | **Mega-MoE fused dispatch→GEMM→SwiGLU→GEMM→combine megakernel** | Replace our DeepEP-dispatch + grouped-GEMM + combine sequence with `deep_gemm.fp8_fp4_mega_moe`. Requires symmetric memory + multi-process launch + PyTorch ≥2.9. vLLM already exposes it as `--moe-backend deep_gemm_mega_moe`, so a port target exists. | MoE GEMMs 19.4% + collectives 19.6% | **1.96× at batch size 1** on a 256-expert/top-6 EP8 config [reported]. BS=1 *is* our C1 regime. Also removes the collective *boundary*, which is where our rank-arrival skew lives. | **High** |
+| 7 | **Confidence-scheduled, load-adaptive verification length** (DSpark) | Profile `SPS(B)` once at engine init into a cost table; implement Algorithm 1 as a dynamic top-K admission over per-request cumulative confidences; run it **asynchronously on 2-steps-prior confidences** so CUDA-graph replay and zero-overhead scheduling still work. Start with EAGLE's existing draft probabilities as a crude confidence proxy — no retraining needed for v1. | the 4.7× per-stream falloff C1→C16 | **+60–85% per-user tok/s at matched throughput** vs static MTP-1 in V4 production [reported]. Exactly our C1↔C16 Pareto problem. | **Medium** (scheduler) / **High** (trained confidence head) |
+| 8 | **Kill per-launch CPU overhead (host codegen)** | Audit every Python-side op wrapper on the decode path; move shape/dtype/stride validation to a generated host launcher, or pre-bake it into CUDA graphs. | everything, at TPOT 2.74 ms | DeepSeek report host-side validation dropping **from tens-to-hundreds of µs to <1 µs per invocation** [reported]. Independently corroborated by Hybrid-EP's 409 vs 599 GB/s Torch-API-vs-kernel gap on B200. | **Medium** |
+
+### Tier 2 — worth a spike
+
+| # | Steal | Concrete change to our SGLang fork | Attacks | Expected effect | Difficulty |
+|---|---|---|---|---|---|
+| 9 | **"Crossover": share dequantized KV between CTAs via distributed shared memory** | Launch DSA decode with cluster size 2; each CTA `__ldg`s and dequantizes half the KV, then `st.async`-writes it into the peer CTA's SMEM, synchronized by a cluster transaction barrier. | attention 10.9% under NVFP4/FP8 KV | 250→410 TFLOPS on H800 [reported]. **Check first**: B200 has native FP4/FP8 conversion paths H800 lacks, so our dequant cycle count may already be below the MMA count — measure before porting. | **Medium–High** |
+| 10 | **DeepEP V2 analytical SM budgeting / Hybrid-EP TMA path** | Call `get_theoretical_num_sms(num_experts, num_topk)` instead of auto-tuning; evaluate the `hybrid-ep` branch (it has NVFP4 support and explicitly targets "single-batch scenarios"). | collectives 19.6% | On B200 EP8: Hybrid-EP hits 409.71 GB/s FP8 dispatch at **16 SMs**, where baseline DeepEP needs 44–48 SMs for 544–554 GB/s. ~30 SMs returned to GEMM. | **Medium** |
+| 11 | **Batch-invariant dual-kernel decode (wave-quantization fix)** | Two bitwise-identical attention kernels: one sequence-per-SM for full waves, a multi-SM-per-sequence variant using thread-block-cluster DSM for the ragged tail wave. | collectives 19.6% (47% rank skew) | Rank-arrival skew at C1 *is* tail-wave latency variance. Closest published analogue to our problem, and B200 has clusters. Reproducibility comes free. | **High** |
+| 12 | **Masked-MHA dense prefill path for short contexts** | Ship two prefill implementations and switch on sequence length, as DeepSeek do for V3.2. | TTFT 189 ms | AA uses ~10k input. At 10k with topk≈2048 the gather+indexer overhead may not pay for itself vs a dense masked kernel. Cheap experiment, possibly large TTFT win. | **Medium** |
+
+### Explicitly *not* worth it, and why
+
+- **EPLB / LPLB at C1.** With 8 active experts routed across 8 ranks at batch 1, the load is 8 tokens over 8 ranks — some ranks get zero work. That imbalance is *structural*, not statistical, and no load balancer fixes it. LPLB's own README states the solver takes **~100 µs**, which is 36× our entire per-token budget. EPLB (130 lines) is still worth wiring up for C64.
+- **On-disk / hierarchical KV cache** for the leaderboard. DeepSeek measured 56.3% of input tokens hitting it in production, which is enormous for cost/user — but **zero effect on Artificial Analysis**, whose prompts are fresh.
+- **Node-limited routing, DualPipe, EP144-style disaggregation.** Anti-transferable: we are one NVLink domain, no PP, and our operating point (365 tok/s single-stream) is the opposite of theirs (20–22 tok/s/user at massive scale).
+- **The `ld.global.nc.L1::no_allocate` PTX hack.** Its correctness argument is explicitly Hopper-specific. Do not port to SM100 without validation.
+- **LogFMT-style log-domain communication compression.** DeepSeek built it, measured it, and killed it: 50–100% encode/decode overhead when fused with all-to-all.
+- **SASS FFMA-interleaving post-processing.** Obsoleted by NVCC 12.9, which does it automatically. DeepGEMM disabled it.
+
+**The single most important number in this whole corpus for us**, from the FlashMLA deep-dive
+[verified]: MLA decode is compute-bound iff `h_q · s_q ≥ 128` on H800-class hardware, and
+DeepSeek explicitly say *"we don't use Tensor Parallel for decoding instances, meaning h_q is
+128 and the kernel is compute-bound."* Under our TP8 with 128 query heads, per-rank `h_q = 16`;
+even with EAGLE giving `s_q ≈ 4`, `h_q·s_q ≈ 64` — **we are on the memory-bound side of the
+line, and DeepSeek deliberately architected to be on the other side.** [inferred]
 
 **The single most important number in this whole corpus for us**, from the FlashMLA deep-dive
 [verified]: MLA decode is compute-bound iff `h_q · s_q ≥ 128` on H800-class hardware, and

@@ -112,7 +112,10 @@ communication work rather than competing with it.
    `--enable-two-batch-overlap` when `index_topk_freq > 1`, because the TBO op
    path does not propagate DSA topk indices across shared layers `[verified,
    local source]`. And TBO is a throughput technique that costs latency at C1 —
-   SGLang measured **−27%** at 32 tokens/device `[verified]`. SBO in our tree
+   SGLang measured **−27% at 32 tokens/device**, and states the break-even is a
+   **threshold between 64 and 128 tokens/device** `[verified; corrected in
+   audit — the original doc mis-stated the positive figure, see §overlap]`.
+   SBO in our tree
    already runs the DeepEP combine on a 32-SM side stream on Blackwell
    (`communicate_num_sms = 32 if is_blackwell()`) with the down-projection GEMM
    signalling per-expert completion `[verified, local source]`. Extend the same
@@ -179,6 +182,44 @@ communication work rather than competing with it.
     bandwidth as the all-reduce it replaces `[verified, Korthikanti et al.]` and
     only buys activation memory, which we are not short of. Revisit only for
     >256K contexts or multi-node.
+
+11. **The one architectural change with a real measured number is
+    Ladder-Residual — and we should cost it, not adopt it.** Feeding layer `i`
+    the output of layer `i−2` instead of `i−1` makes the all-reduce of `x_i`
+    concurrent with the compute of `h_{i+1}`, so the collective overlaps *without
+    splitting any GEMM* — which is exactly the failure mode that kills TBO and
+    TransformerEngine at our batch size. Measured **29% end-to-end on 8×H100 for
+    a 70B model at TP8**, rising to **60% with P2P disabled**; on Llama-3.1-8B a
+    retrofit of the upper 16 layers plus **3B tokens** of retraining recovered
+    quality (56.11 → 41.65 → 57.61 avg) and gave **21% at TP8, batch 1**
+    `[verified, ICML 2025]`. That last number is measured in exactly our regime.
+    The catch is fatal for adoption on GLM-5.2: it requires retraining weights we
+    do not own. **Action: raise it with whoever trains the next model, not with
+    the serving team.**
+
+12. **Shift Parallelism is the right framing for our two-objective problem, and
+    it is already a vLLM plugin.** Snowflake's observation is that SP (Ulysses)
+    has DP-like throughput but, unlike DP, is **KV-cache-invariant** — so you can
+    switch between TP and SP *at runtime, per batch*, which you cannot do between
+    TP and DP. Reported **1.51× faster response in interactive workloads and +50%
+    throughput in batch workloads vs TP-only** `[reported, arXiv 2509.16495;
+    hardware not stated in the abstract]`, shipped as the `arctic-inference` vLLM
+    plugin `[reported, arXiv 2507.11830]`. We run SGLang, not vLLM, so this is
+    not a drop-in — but "one config, two operating points, switched by traffic"
+    is precisely the problem statement we were handed, and nobody else in this
+    literature states it that cleanly.
+
+13. **Attention-FFN disaggregation (Step-3's AFD) is the disaggregation axis that
+    actually applies to an 8-GPU box.** Prefill/decode disaggregation needs ≥2
+    nodes to rate-match. Splitting *attention* from *FFN* does not: MegaScale-Infer
+    (SIGCOMM'25) and Step-3 both run attention and expert pools as separate
+    deployments with micro-batches ping-ponging between them. Step-3 reports
+    **4,039 decode tok/s/GPU on Hopper at FP8, 4K context, 50 ms TPOT SLO, vs
+    DeepSeek-V3's 2,324 in the same setup** `[reported, arXiv 2507.19427]` — the
+    largest per-GPU decode number in this document that is not simulated. It is
+    a co-design result (their MFA attention is built for it), so it does not
+    transfer wholesale, but it is the strongest evidence that our
+    attention/MoE ratio is a schedulable resource and not a fixed cost.
 
 ---
 
@@ -328,11 +369,12 @@ OPT-175B `[verified]`.
 
 | paper | lab | venue+year | hardware | headline | production? |
 |---|---|---|---|---|---|
-| Megatron-LM: Training Multi-Billion Parameter LMs Using Model Parallelism (arXiv 1909.08053) | NVIDIA (Shoeybi et al.) | arXiv 2019 | 512× V100 | 15.1 PFLOPS, 76% scaling efficiency vs single-GPU `[verified]` | **Universal** — every engine |
-| Efficient Large-Scale LM Training on GPU Clusters Using Megatron-LM (arXiv 2104.04473) | NVIDIA/Stanford/MSR (Narayanan et al.) | SC 2021 | up to 3072× A100 | bubble `(p−1)/m`, interleaved `(p−1)/(v·m)` `[verified]` | Yes |
-| Reducing Activation Recomputation in Large Transformer Models (arXiv 2205.05198) | NVIDIA (Korthikanti et al.) | arXiv 2022 | 2240× A100, 530B GPT | 5× activation memory reduction; 54.2% MFU vs 42.1% `[verified]` | Yes (Megatron-LM, NeMo) |
-| Characterizing Communication Patterns in Distributed LLM Inference (arXiv 2507.14392) | Ohio State (Xu, Panda et al.) | arXiv 2025 | 4× H100 + IB NDR400, vLLM 0.8.5 | TP8 across nodes: TPOT **11.56 ms** vs TP4 intra-node **0.86 ms** `[verified]` | n/a (measurement study) |
-| Flash Communication (arXiv 2412.04964) | Meituan (Li et al.) | arXiv 2024 | not stated in abstract | >3× intra-node comm speedup, 2× TTFT `[reported]` | No — one paper |
+| Megatron-LM: Training Multi-Billion Parameter LMs Using Model Parallelism (arXiv 1909.08053) | NVIDIA (Shoeybi et al.) | arXiv 2019 | 512× V100 SXM3 32GB (32× DGX-2H) | 15.1 PFLOPS, **76% scaling efficiency** vs a 39 TFLOPS single-GPU baseline (30% of peak) `[verified]` | **Universal** — every engine |
+| Efficient Large-Scale LM Training on GPU Clusters Using Megatron-LM (arXiv 2104.04473) | NVIDIA/Stanford/MSR (Narayanan et al.) | SC 2021 | up to 3072× A100 | bubble `(p−1)/m`, interleaved `(1/v)·(p−1)/m` `[verified]` | Yes |
+| Reducing Activation Recomputation in Large Transformer Models (arXiv 2205.05198) | NVIDIA (Korthikanti et al.) | arXiv 2022 | 2240× A100-80GB, 530B GPT | 5× activation memory reduction; **54.2% MFU vs 42.1%** with full recompute (a 29% improvement) `[verified]` | Yes (Megatron-LM, NeMo) |
+| **Efficiently Scaling Transformer Inference** (arXiv 2211.05102) — *added in audit* | Google (Pope, Douglas, Chowdhery, Devlin, Bradbury, … Dean) | **MLSys 2023** | TPU v4 slices, PaLM 540B | **29 ms/token** generation at int8 weights; **76% MFU** at large batch; MQA enables 32× longer context `[verified]` | Yes — this partitioning model is what the GPU engines reimplemented |
+| Characterizing Communication Patterns in Distributed LLM Inference (arXiv 2507.14392) | Ohio State (Xu, Kandadi Suresh, Anthony, Alnaasan, Panda) | **Hot Interconnects 2025** `[corrected in audit]` | 2 nodes × 4× H100 94GB NVLink, IB NDR400 (4 NIC/node), vLLM 0.8.5, Llama-3.2-3B | TP8 **across the node boundary**: TPOT **11.56 ms** vs TP4 intra-node **0.86 ms**; TTFT still improved 90→30 ms `[verified]` | n/a (measurement study) |
+| Flash Communication (arXiv 2412.04964) | Qingyuan Li et al. — *affiliation not stated on the fetched abstract page* `[corrected in audit]` | arXiv 2024 | not stated in abstract | >3× intra-node comm speedup, 2× TTFT `[reported]` | No — one paper |
 
 ### The mechanism, exactly
 
@@ -357,6 +399,50 @@ more traffic than PP per layer at t=8 — which is exactly why the paper's
 recommendation is *"tensor model parallelism should generally be used up to
 degree g when using g-GPU servers, and then pipeline model parallelism can be
 used to scale up to larger models across servers"* `[verified]`.
+
+### Pope et al. — the partitioning cost model the rest of this document assumes
+
+*(Added in audit: the original document reasoned about partitioning without
+citing the paper that formalised it. This is the classic, and it is still the
+cleanest statement of the trade.)*
+
+Pope et al. treat layout selection as an optimisation over how each weight
+matrix's `E×F` (hidden × ffn) axes are split across `n_chips`, in a notation
+where `BLE_xyz` means "the `E` axis of a logically-`BLE` tensor is split
+`x×y×z`". Three layouts, with their communication cost `[verified]`:
+
+| layout | what is sharded | `T_comm` | scaling in `n_chips` |
+|---|---|---|---|
+| **1D weight-stationary** | each `E×F` matrix along one axis | `2·B·L·E / bw` | **constant** — does not improve with more chips |
+| **2D weight-stationary** | both `E` and `F`, roughly square | `8·B·L·E / (√n_chips · bw)` | `O(1/√n_chips)` |
+| **weight-gathered** | activations stationary, weights broadcast | `4·E·√(B·L·F) / (√n_chips · bw)` | `O(√(BL))` not `O(BL)` — wins at large batch |
+
+The decision rule, quoted in effect: **2D weight-stationary becomes more
+communication-efficient than 1D when `n_chips > d_ff / d_model`** `[verified]`.
+For a conventional `d_ff = 4·d_model` that is `n_chips > 16`.
+
+**Why this matters for us, and the honest caveat.** Our dense layers on the
+DeepSeek-V3.2 bracket have `d_ff = 18432`, `d_model = 7168`, so
+`d_ff/d_model ≈ 2.57` and **TP8 is already past Pope's 1D→2D crossover**
+`[inferred]`. On the MoE layers `d_ff = 2048` and the ratio is 0.286, so it is
+past it by a factor of 28. Taken literally, that says our 1D column/row Megatron
+split is the wrong layout at TP8.
+
+Take it *not* literally. Pope's model is derived for a TPU v4 **3D torus**, where
+bandwidth per chip is fixed and the `√n_chips` term comes from the mesh geometry.
+On an NVSwitch all-to-all fabric every pair of GPUs has full bandwidth and there
+is no mesh dimension to exploit, so the `1/√n_chips` benefit largely evaporates —
+and more importantly, at batch 1 we established that `T_comm` is **not** a
+bandwidth term at all (14 KiB, 0.028 µs of wire time). A 2D layout would *add*
+barriers to save bandwidth we are not spending. **Verdict: Pope's model is the
+right way to think, and its conclusion does not transfer to an 8-GPU NVLink
+domain at decode batch sizes.** It becomes relevant again at prefill, at large
+`n_chips`, and on any fabric that is a mesh rather than a switch — i.e. exactly
+where the multi-node section of this document ends up.
+
+The other durable contribution is the framing: partitioning is a **Pareto
+frontier between latency and MFU**, not a single optimum. That is the same
+two-objective problem we were handed, stated in 2022.
 
 ### Sequence parallelism (Megatron-SP) — the free memory trick
 
@@ -388,10 +474,10 @@ decode, and is an argument for disaggregation on its own.
 
 | paper | lab | venue+year | hardware | headline | production? |
 |---|---|---|---|---|---|
-| Ring Attention with Blockwise Transformers (arXiv 2310.01889) | UC Berkeley (Liu, Zaharia, Abbeel) | arXiv 2023 (listed at NeurIPS 2023) | 32× A100, TPUv4-1024 | 4096K ctx on 32×A100 (7B); 256–512× prior SOTA `[verified]` | Yes — in most CP impls |
-| DeepSpeed-Ulysses (arXiv 2309.14509) | Microsoft (DeepSpeed) | arXiv 2023 | up to 256× A100, GPT 1.2/7/30B | 2.5× faster at 4× longer seq vs Megatron-SP; per-link volume `4Nh/P` vs `4Nh` `[verified]` | Yes — DeepSpeed, SGLang, vLLM |
-| Striped Attention (arXiv 2311.09431) | MIT CSAIL (Brandon, Ragan-Kelley et al.) | arXiv 2023 | 8× A100, 16× TPUv4 | **1.45×** @256K on A100; **1.65×** @786K on TPUv4 `[verified]` | Partially — "zigzag" ring in most libs |
-| USP: A Unified Sequence Parallelism Approach (arXiv 2405.07719) | Tencent (Fang, Zhao) | arXiv 2024 | 2×8 A800, L20 PCIe | 47% MFU LLAMA3-8B @208K on 2 nodes `[verified]` | Yes — yunchang/xDiT |
+| Ring Attention with Blockwise Transformers (arXiv 2310.01889) | UC Berkeley (Liu, Zaharia, Abbeel) | **arXiv 2023 — preprint; dblp records no archival conference version** `[corrected in audit: the original claimed "listed at NeurIPS 2023", which I could not confirm]` | 32× A100, TPUv4-1024 | 4096K ctx on 32×A100 (7B); 256–512× prior SOTA `[verified]` | Yes — in most CP impls |
+| DeepSpeed Ulysses (arXiv 2309.14509) | Microsoft DeepSpeed (Jacobs, Tanaka, … Rajbhandari, He) | arXiv 2023 | up to 256× A100, GPT 1.2/7/30B, seq to 1M | 2.5× faster at 4× longer seq vs Megatron-SP; per-link volume `4Nh/P` vs `4Nh` `[verified]` | Yes — DeepSpeed, SGLang, vLLM |
+| Striped Attention (arXiv 2311.09431) | MIT CSAIL (Brandon, Nrusimha, … Ragan-Kelley) | arXiv 2023 | 8× A100, 16× TPUv4 | **1.41–1.45×** @256K on 8×A100 (theoretical max 1.70–1.72×); **1.65×** @786K on 16× TPUv4 `[verified]` | Partially — "zigzag" ring in most libs |
+| USP: A Unified Sequence Parallelism Approach (arXiv 2405.07719) | Fang & Zhao (Tencent) | arXiv 2024 | 2 nodes × 8× A800 (400 GB/s NVLink); 8× L20 PCIe; 8× A100 SXM | **47% MFU** LLAMA3-8B @208K on 2 nodes; 49% @120K `[verified]` | Yes — yunchang/xDiT |
 | Context Parallelism for Scalable Million-Token Inference (arXiv 2411.01783) | Meta (Yang et al.) | MLSys 2025 | 128× H100 / 16 nodes, Llama3 405B | **1M prefill in 77 s**, 93% parallelisation efficiency, 63% FLOPS util `[verified]` | Yes — Meta production |
 
 ### Ring Attention
@@ -414,8 +500,12 @@ others compute a fully-unmasked one, and *iteration latency is set by the
 slowest device*, so the savings from masking are never realised `[verified]`. The
 fix is to stripe: device `i` owns tokens `i, i+N, i+2N, …` instead of a
 contiguous chunk, so **every** device sees a roughly triangular mask on **every**
-round. Theoretical max speedup 1.85× (TPUv4) / 1.72× (A100); achieved **1.65×**
-at 786K on 16 TPUv4 and **1.45×** at 256K on 8×A100 `[verified]`.
+round. On 8×A100 at 256K the theoretical maximum speedup is **1.70–1.72×** across
+model sizes and the achieved speedup is **1.41–1.45×**; on 16× TPUv4 at 786K the
+achieved speedup is **1.65×** `[verified; corrected in audit — the original
+quoted a 1.85× TPUv4 theoretical maximum that I could not confirm in the text]`.
+The residual gap between theory and practice is attributed to tile-granularity
+masking and imperfect compute/communication overlap `[verified]`.
 
 **This is the same class of bug as our 47% rank-arrival skew.** The lesson
 generalises: in any collective-synchronised loop, the cost is `max` over ranks,
@@ -482,10 +572,11 @@ exceed ~256K. Our `--attn-cp-size` / `--dcp-size` flags exist in the tree.
 
 | paper | lab | venue+year | hardware | headline | production? |
 |---|---|---|---|---|---|
-| Megatron SC'21 (arXiv 2104.04473) | NVIDIA | SC 2021 | 3072× A100 | bubble `(p−1)/m` → `(p−1)/(v·m)` interleaved `[verified]` | Yes (training) |
+| Megatron SC'21 (arXiv 2104.04473) | NVIDIA | SC 2021 | 3072× A100 | bubble `(p−1)/m` → `(1/v)·(p−1)/m` interleaved `[verified]` | Yes (training) |
 | DistServe (arXiv 2401.09670) | PKU + UCSD | OSDI 2024 | 32× A100-80GB | inter-op (PP) "almost linearly scales throughput" for decode; intra-op (TP) has diminishing returns `[verified]` | Concepts adopted widely |
-| Mooncake (arXiv 2407.00079) | Moonshot AI + Tsinghua | arXiv 2024 (rev. 2025) | Kimi production cluster | chunked pipeline parallelism for long ctx; **75% more requests** in real workload `[verified]` | **Yes** — Kimi production |
-| MegaScale-Infer (arXiv 2504.02263) | ByteDance + PKU | SIGCOMM 2025 | H20 / L40S / A100 | ping-pong PP between attention and FFN nodes; **1.90×** per-GPU throughput `[verified]` | ByteDance production |
+| Mooncake (arXiv 2407.00079) | Moonshot AI + Tsinghua (Qin, Li, He, Zhang, Wu, Zheng, Xu) | arXiv 2024 (rev. Sep 2025) | Kimi production cluster (config not disclosed) | chunked pipeline parallelism for long ctx; **+525%** throughput in simulation, **+75% requests** in real workload `[verified]` | **Yes** — Kimi production |
+| MegaScale-Infer (arXiv 2504.02263) | ByteDance + PKU (Zhu, Jiang, Jin et al.) | **SIGCOMM 2025**, DOI 10.1145/3718958.3750506 — note the proceedings title differs: *"Efficient Mixture-of-Experts Model Serving with Disaggregated Expert Parallelism"* `[verified via dblp]` | 8 nodes × 8× A100-80GB (homogeneous); H20 + L40S (heterogeneous) `[corrected in audit]` | ping-pong PP between attention and FFN nodes; **1.90×** per-GPU decode throughput vs TensorRT-LLM `[verified]` | ByteDance production |
+| **Step-3** (arXiv 2507.19427) — *added in audit* | StepFun | arXiv 2025 | Hopper, FP8, 4K context | Attention-FFN Disaggregation; **4,039 decode tok/s/GPU** at a 50 ms TPOT SLO vs DeepSeek-V3's **2,324** in the same setup `[reported]` | StepFun production (Step-3 is 321B total / 38B active) |
 
 ### Why PP fails at low batch, quantitatively
 
