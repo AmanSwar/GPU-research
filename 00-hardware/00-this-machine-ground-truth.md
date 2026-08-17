@@ -14,17 +14,25 @@ Everything below is `[verified]` unless marked otherwise.
 
 ## Bottom line for our system
 
-- **The benchmark runs at 81% of peak clock.** Max SM clock is **1965 MHz**; our
-  runs lock to **1597 MHz** for reproducibility. That is a standing **19% haircut
-  on every compute-bound number we publish** — including the 365 tok/s headline.
-  Before chasing kernel-level percentages, quantify what unlocking costs in
-  variance and what it buys in throughput.
-- **L2 is 126.5 MiB and up to 79.06 MiB of it can be pinned.** This is a much
-  bigger lever on Blackwell than on Hopper (50 MiB L2, no comparably large
-  persisting window). At batch 1 our decode is bandwidth-bound on weights that
-  stream from HBM every token — the persisting-L2 window is the mechanism for
-  keeping a hot working set (router weights, shared expert, attention
-  projections, the DSA indexer's weights) off HBM entirely.
+- **1597 MHz is not a lock and not a haircut.** ~~Earlier revisions of this file
+  read the 1965 MHz maximum against our 1597 MHz operating point and called it a
+  standing 19% loss.~~ That was wrong, and
+  [`07-power-clocks…`](07-power-clocks-thermals-and-determinism.md) settled it by
+  measurement rather than inference: clocks on this box are **not locked** (idle
+  GPUs sit at 120 MHz, a lightly loaded one boosts to the full 1965 MHz), and a
+  compute-saturating GEMM is **power-capped down to 1072–1222 MHz** at ~990 W
+  with `SW Power Cap` continuously asserted, at 52–61 °C — nowhere near thermal.
+  **1597 MHz is the free-running DVFS plateau for memory-bound work**, i.e. where
+  latency-bound decode parks because there is nothing for a higher clock to do.
+  There is no 19% sitting there to reclaim.
+- **L2 persistence is a measured negative result, not an opportunity.** The
+  driver reports 126.50 MiB of L2 with 79.06 MiB pinnable, and that reads like the
+  obvious weapon against batch-1 weight streaming. It is not: a
+  `cudaAccessPolicyWindow` experiment measured **+3% at best, and −5% when sized
+  to the full 79 MiB**, and the effective all-SM-shared L2 is **~63 MiB rather
+  than 126.5** (the aggregate figure spans two dies). Per-instruction
+  `.L2::evict_*` control needs 256-bit vector types that ptxas 13.3 requires.
+  Recorded here so the capability numbers below are not mistaken for headroom.
 - **The 8 GPUs are property-identical.** The probe diffs every device attribute
   against GPU 0 and finds *no* differences. So the persistent rank-arrival skew
   in our profile (rank 0 last to arrive 24% of the time) is **not** explained by
@@ -94,22 +102,35 @@ register file (see
 pipelines hide latency with in-flight work rather than with warp count. Do not
 read low occupancy as a defect on this architecture.
 
-### Clock headroom, quantified
+### Clock headroom: there is none to reclaim
 
-The clock lock is a measurement decision with a performance price. At the same
-SM count and per-SM issue rate, peak compute scales linearly with clock:
+`CLOCK_RATE_KHZ` reports the 1965 MHz maximum, and it is tempting to read our
+1597 MHz operating point against it as a 19% self-inflicted loss. **That
+inference is wrong**, and it is worth spelling out why, because it is exactly the
+kind of error a capability-listing document invites.
 
-```
-1597 / 1965 = 0.8127
-```
+What measurement found (full tables in
+[`07-power-clocks…`](07-power-clocks-thermals-and-determinism.md)):
 
-So every compute-bound kernel in our profile — dense GEMM at 37.1%, MoE expert
-GEMMs at 19.4% — runs **at most 81.3% as fast as this silicon can go**, by our
-own configuration choice. Memory-bound kernels are unaffected (HBM clock is
-independent and already at its 3996 MHz maximum). The open question is what boost
-clocks actually sustain under a 1000 W sustained NVFP4 load, which is a
-measurement, not a lookup: `SW Power Capping` has already accumulated **90.9
-seconds** on this box, so the part does hit its power cap in practice.
+| state | SM clock | note |
+|---|---:|---|
+| all 8 GPUs idle | **120 MHz** | a lock would forbid this |
+| lightly loaded | **1965 MHz** | full boost is reachable |
+| memory-bound kernels | **~1597 MHz** | the free-running DVFS plateau |
+| compute-saturating GEMM | **1072–1222 MHz** | power-capped at ~990 W, 52–61 °C |
+
+Three conclusions. The clocks are **not locked** — the 120 MHz idle proves it.
+1597 MHz is where *memory-bound* work naturally parks, not a ceiling imposed on
+it. And the genuinely compute-bound case runs *slower still*, at **55–62% of
+boost**, because 148 SMs issuing tensor-core work hit the 1000 W envelope long
+before they hit a clock limit. `SW Power Capping` has accumulated **90.9 seconds**
+on this box, which is that mechanism engaging.
+
+The practical consequence: **B200 is power-limited, not clock-limited, on dense
+tensor-core work.** Optimizations that reduce energy per useful FLOP (fewer
+wasted bytes, better SM packing, less redundant compute) therefore buy clock
+headroom as a side effect, while anything premised on "unlock the clocks" buys
+nothing.
 
 ## 3. Memory hierarchy, as the driver reports it
 
